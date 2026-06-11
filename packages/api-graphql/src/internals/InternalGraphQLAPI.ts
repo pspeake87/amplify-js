@@ -26,7 +26,12 @@ import {
 } from '@aws-amplify/data-schema/runtime';
 
 import { AWSAppSyncRealTimeProvider } from '../Providers/AWSAppSyncRealTimeProvider';
-import { GraphQLOperation, GraphQLOptions, GraphQLResult } from '../types';
+import {
+	GraphQLAuthTokenSource,
+	GraphQLOperation,
+	GraphQLOptions,
+	GraphQLResult,
+} from '../types';
 import { resolveConfig, resolveLibraryOptions } from '../utils';
 import { repackageUnauthorizedError } from '../utils/errors/repackageAuthError';
 import { NO_ENDPOINT } from '../utils/errors/constants';
@@ -181,7 +186,7 @@ export class InternalGraphQLAPIClass {
 		additionalHeaders: CustomHeaders = {},
 		abortController: AbortController,
 		customUserAgentDetails?: CustomUserAgentDetails,
-		authToken?: string,
+		authToken?: GraphQLAuthTokenSource,
 	): Promise<GraphQLResult<T>> {
 		const {
 			apiKey,
@@ -229,10 +234,12 @@ export class InternalGraphQLAPIClass {
 		}
 
 		// if an authorization header is set, have the explicit authToken take precedence
-		if (authToken) {
+		const resolvedAuthToken =
+			typeof authToken === 'function' ? await authToken() : authToken;
+		if (resolvedAuthToken) {
 			additionalCustomHeaders = {
 				...additionalCustomHeaders,
-				Authorization: authToken,
+				Authorization: resolvedAuthToken,
 			};
 		}
 
@@ -364,7 +371,7 @@ export class InternalGraphQLAPIClass {
 		}: GraphQLOptions,
 		additionalHeaders: CustomHeaders = {},
 		customUserAgentDetails?: CustomUserAgentDetails,
-		authToken?: string,
+		authToken?: GraphQLAuthTokenSource,
 	): Observable<any> {
 		const config = resolveConfig(amplify);
 

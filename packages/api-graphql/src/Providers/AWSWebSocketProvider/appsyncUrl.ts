@@ -137,11 +137,17 @@ export const additionalHeadersFromOptions = async (
 		additionalCustomHeaders = additionalHeaders;
 	}
 
-	// if an authorization header is set, have the explicit, operation-level authToken take precedence
-	if (authToken) {
+	// If an authorization header is set, have the explicit, operation-level
+	// authToken take precedence. A function-form authToken is resolved here —
+	// this runs on every (re)connection and subscription replay, so expiring
+	// tokens (e.g. lambda auth mode) are fetched fresh instead of reusing the
+	// value captured when the subscription was first established.
+	const resolvedAuthToken =
+		typeof authToken === 'function' ? await authToken() : authToken;
+	if (resolvedAuthToken) {
 		additionalCustomHeaders = {
 			...additionalCustomHeaders,
-			Authorization: authToken,
+			Authorization: resolvedAuthToken,
 		};
 	}
 

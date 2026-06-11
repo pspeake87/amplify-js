@@ -722,6 +722,67 @@ describe('error handler', () => {
 	}
 });
 
+describe('lambda auth mode token refresh', () => {
+	let Model: PersistentModelConstructor<ModelType>;
+
+	test('passes authToken as a function that re-invokes functionAuthProvider', async () => {
+		mockGraphQL.mockClear();
+		mockObservable = new Observable(() => {});
+
+		let currentToken = 'initial-token';
+		const functionAuthProvider = jest.fn(async () => ({
+			token: currentToken,
+		}));
+
+		const { initSchema, DataStore } = require('../src/datastore/datastore');
+		const classes = initSchema(smallTestSchema());
+		({ Model } = classes as {
+			Model: PersistentModelConstructor<ModelType>;
+		});
+
+		await DataStore.start();
+		const { schema } = (DataStore as any).storage.storage;
+
+		const subscriptionProcessor = new SubscriptionProcessor(
+			schema,
+			new WeakMap(),
+			{
+				aws_project_region: 'us-west-2',
+				aws_appsync_graphqlEndpoint:
+					'https://xxxxxxxxxxxxxxxxxxxxxx.appsync-api.us-west-2.amazonaws.com/graphql',
+				aws_appsync_region: 'us-west-2',
+				aws_appsync_authenticationType: 'AWS_LAMBDA',
+				authProviders: { functionAuthProvider },
+			},
+			() => ['lambda'],
+			() => null,
+		);
+
+		const subscriptions = subscriptionProcessor.start();
+		const sub = subscriptions[0].subscribe({});
+
+		// wait for the async subscription setup to reach the graphql call
+		for (let i = 0; i < 50 && mockGraphQL.mock.calls.length === 0; i++) {
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		expect(mockGraphQL).toHaveBeenCalled();
+
+		const { authToken } = (mockGraphQL.mock.calls[0] as any)[0];
+		expect(typeof authToken).toBe('function');
+
+		// token must NOT have been resolved eagerly at subscription setup
+		expect(functionAuthProvider).not.toHaveBeenCalled();
+
+		// each invocation consults the provider and observes fresh tokens
+		await expect(authToken()).resolves.toEqual('initial-token');
+		currentToken = 'refreshed-token';
+		await expect(authToken()).resolves.toEqual('refreshed-token');
+		expect(functionAuthProvider).toHaveBeenCalledTimes(2);
+
+		sub.unsubscribe();
+	});
+});
+
 const accessTokenPayload = {
 	sub: 'xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx',
 	'cognito:groups': ['mygroup'],

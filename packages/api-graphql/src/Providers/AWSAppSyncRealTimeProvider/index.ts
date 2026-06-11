@@ -13,6 +13,7 @@ import { CustomHeaders } from '@aws-amplify/data-schema/runtime';
 import { DEFAULT_KEEP_ALIVE_TIMEOUT, MESSAGE_TYPES } from '../constants';
 import { AWSWebSocketProvider } from '../AWSWebSocketProvider';
 import { awsRealTimeHeaderBasedAuth } from '../AWSWebSocketProvider/authHeaders';
+import { GraphQLAuthTokenSource } from '../../types';
 
 // resolved/actual AuthMode values. identityPool gets resolves to IAM upstream in InternalGraphQLAPI._graphqlSubscribe
 type ResolvedGraphQLAuthModes = Exclude<GraphQLAuthMode, 'identityPool'>;
@@ -27,7 +28,7 @@ export interface AWSAppSyncRealTimeProviderOptions {
 	libraryConfigHeaders?(): Promise<Record<string, unknown> | Headers>;
 	additionalHeaders?: CustomHeaders;
 	additionalCustomHeaders?: Record<string, string>;
-	authToken?: string;
+	authToken?: GraphQLAuthTokenSource;
 }
 
 interface DataObject extends Record<string, unknown> {

@@ -29,6 +29,17 @@ export { SelectionSet } from '@aws-amplify/data-schema/runtime';
 export type { CommonPublicClientOptions };
 
 /**
+ * An auth token for a GraphQL operation: either a resolved token string, or a
+ * function returning a fresh token. The function form is re-invoked on every
+ * realtime (re)connection attempt, so tokens that expire (e.g. `lambda` auth
+ * mode tokens from a `functionAuthProvider`) are refreshed instead of being
+ * captured once at subscription setup.
+ */
+export type GraphQLAuthTokenSource =
+	| string
+	| (() => Promise<string | undefined>);
+
+/**
  * Loose/Unknown options for raw GraphQLAPICategory `graphql()`.
  */
 export interface GraphQLOptions {
@@ -36,7 +47,7 @@ export interface GraphQLOptions {
 	endpoint?: string;
 	variables?: Record<string, DocumentType>;
 	authMode?: GraphQLAuthMode;
-	authToken?: string;
+	authToken?: GraphQLAuthTokenSource;
 	apiKey?: string;
 	/**
 	 * @deprecated This property should not be used

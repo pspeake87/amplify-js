@@ -357,10 +357,13 @@ class SubscriptionProcessor {
 											addFilter,
 										);
 
-										const authToken = await getTokenForCustomAuth(
-											authMode,
-											this.amplifyConfig,
-										);
+										// Passed as a function so the realtime layer re-invokes the
+										// custom auth provider on every (re)connection. A resolved
+										// string here goes stale: reconnects (network drops, the
+										// 24h AppSync connection limit) would replay the original
+										// token and fail with Unauthorized once it expires.
+										const authToken = () =>
+											getTokenForCustomAuth(authMode, this.amplifyConfig);
 
 										const variables = {};
 
