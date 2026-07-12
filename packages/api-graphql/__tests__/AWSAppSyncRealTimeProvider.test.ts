@@ -1039,6 +1039,152 @@ describe('AWSAppSyncRealTimeProvider', () => {
 					});
 				});
 
+				test('start_ack timeout must not replay start with the same id on the still-open socket', async () => {
+					// AppSync scopes subscription ids per WebSocket connection: a second
+					// `start` for an id already registered on the connection is rejected
+					// with DuplicatedOperationError. A missed start_ack for one
+					// subscription must therefore never cause other, healthy
+					// subscriptions to re-send `start` over the same socket — the socket
+					// has to be genuinely closed first so the resubscription happens on a
+					// fresh connection.
+					await replaceConstant('START_ACK_TIMEOUT', 150, async () => {
+						// Ordered log of sent frames and close() calls, so the invariant
+						// "no repeated start for an id without an intervening close" can
+						// be checked against the exact sequence the socket saw.
+						const socketLog: { event: string; id?: string }[] = [];
+						const fakeSocket = fakeWebSocketInterface.webSocket;
+						const originalSend = fakeSocket.send.bind(fakeSocket);
+						jest.spyOn(fakeSocket, 'send').mockImplementation((data: any) => {
+							const frame = JSON.parse(String(data));
+							socketLog.push({ event: frame.type, id: frame.id });
+							originalSend(data);
+						});
+						const originalClose = fakeSocket.close.bind(fakeSocket);
+						jest
+							.spyOn(fakeSocket, 'close')
+							.mockImplementation((code?: number, reason?: string) => {
+								socketLog.push({ event: 'close' });
+								originalClose(code, reason);
+							});
+
+						// Subscription A connects and is acked
+						const observerA = provider.subscribe({
+							appSyncGraphqlEndpoint: 'ws://localhost:8080',
+						});
+						observerA.subscribe({ error: () => {} });
+
+						await fakeWebSocketInterface?.standardConnectionHandshake();
+						const idA = socketLog.find(
+							f => f.event === MESSAGE_TYPES.GQL_START,
+						)?.id;
+						expect(idA).toBeDefined();
+						await fakeWebSocketInterface?.sendMessage(
+							new MessageEvent('start_ack', {
+								data: JSON.stringify({
+									type: MESSAGE_TYPES.GQL_START_ACK,
+									payload: {},
+									id: idA,
+								}),
+							}),
+						);
+						await fakeWebSocketInterface?.waitUntilConnectionStateIn([
+							CS.Connected,
+						]);
+
+						// Subscription B starts on the same socket but its start_ack never
+						// arrives, so _timeoutStartSubscriptionAck fires
+						const observerB = provider.subscribe({
+							appSyncGraphqlEndpoint: 'ws://localhost:8080',
+						});
+						observerB.subscribe({ error: () => {} });
+
+						await fakeWebSocketInterface?.waitUntilConnectionStateIn([
+							CS.ConnectionDisrupted,
+						]);
+
+						// Give the ReconnectionMonitor (RECONNECT_DELAY is 100ms in this
+						// suite) time to fire the resubscription replay
+						await delay(500);
+
+						const firstClose = socketLog.findIndex(f => f.event === 'close');
+						const startsForABeforeClose = socketLog
+							.map((f, i) => ({ ...f, i }))
+							.filter(f => f.event === MESSAGE_TYPES.GQL_START && f.id === idA)
+							.filter(f => firstClose === -1 || f.i < firstClose);
+						expect(startsForABeforeClose).toHaveLength(1);
+					});
+				});
+
+				test('subscription start failure must not replay start with the same id on the still-open socket', async () => {
+					// Same invariant as above, via the other trigger: a throw while
+					// preparing one subscription's start message (e.g. custom-auth token
+					// resolution failing) lands in startSubscription's catch and must not
+					// mark the shared, healthy socket as disrupted without closing it.
+					const socketLog: { event: string; id?: string }[] = [];
+					const fakeSocket = fakeWebSocketInterface.webSocket;
+					const originalSend = fakeSocket.send.bind(fakeSocket);
+					jest.spyOn(fakeSocket, 'send').mockImplementation((data: any) => {
+						const frame = JSON.parse(String(data));
+						socketLog.push({ event: frame.type, id: frame.id });
+						originalSend(data);
+					});
+					const originalClose = fakeSocket.close.bind(fakeSocket);
+					jest
+						.spyOn(fakeSocket, 'close')
+						.mockImplementation((code?: number, reason?: string) => {
+							socketLog.push({ event: 'close' });
+							originalClose(code, reason);
+						});
+
+					// Subscription A connects and is acked
+					const observerA = provider.subscribe({
+						appSyncGraphqlEndpoint: 'ws://localhost:8080',
+					});
+					observerA.subscribe({ error: () => {} });
+
+					await fakeWebSocketInterface?.standardConnectionHandshake();
+					const idA = socketLog.find(
+						f => f.event === MESSAGE_TYPES.GQL_START,
+					)?.id;
+					expect(idA).toBeDefined();
+					await fakeWebSocketInterface?.sendMessage(
+						new MessageEvent('start_ack', {
+							data: JSON.stringify({
+								type: MESSAGE_TYPES.GQL_START_ACK,
+								payload: {},
+								id: idA,
+							}),
+						}),
+					);
+					await fakeWebSocketInterface?.waitUntilConnectionStateIn([
+						CS.Connected,
+					]);
+
+					// Subscription B fails before its start message can be sent
+					jest
+						.spyOn(provider as any, '_prepareSubscriptionPayload')
+						.mockRejectedValueOnce(new Error('No auth token specified'));
+					const observerB = provider.subscribe({
+						appSyncGraphqlEndpoint: 'ws://localhost:8080',
+					});
+					observerB.subscribe({ error: () => {} });
+
+					await fakeWebSocketInterface?.waitUntilConnectionStateIn([
+						CS.ConnectionDisrupted,
+					]);
+
+					// Give the ReconnectionMonitor (RECONNECT_DELAY is 100ms in this
+					// suite) time to fire the resubscription replay
+					await delay(500);
+
+					const firstClose = socketLog.findIndex(f => f.event === 'close');
+					const startsForABeforeClose = socketLog
+						.map((f, i) => ({ ...f, i }))
+						.filter(f => f.event === MESSAGE_TYPES.GQL_START && f.id === idA)
+						.filter(f => firstClose === -1 || f.i < firstClose);
+					expect(startsForABeforeClose).toHaveLength(1);
+				});
+
 				test('connection init timeout met', async () => {
 					expect.assertions(2);
 					await replaceConstant('CONNECTION_INIT_TIMEOUT', 20, async () => {

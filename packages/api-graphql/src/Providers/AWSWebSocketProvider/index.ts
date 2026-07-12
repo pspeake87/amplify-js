@@ -173,7 +173,14 @@ export abstract class AWSWebSocketProvider {
 							this.logger.debug(
 								`${CONTROL_MSG.REALTIME_SUBSCRIPTION_INIT_ERROR}: ${err}`,
 							);
-							this._closeSocket();
+							// The socket must genuinely close here, not just be recorded
+							// as disrupted: the ReconnectionMonitor replays every
+							// subscription with its original id, and AppSync scopes ids
+							// per connection — replaying onto the still-open socket is
+							// rejected with DuplicatedOperationError.
+							this._errorDisconnect(
+								CONTROL_MSG.REALTIME_SUBSCRIPTION_INIT_ERROR,
+							);
 						})
 						.finally(() => {
 							subscriptionStartInProgress = false;
@@ -798,7 +805,11 @@ export abstract class AWSWebSocketProvider {
 				subscriptionState: SUBSCRIPTION_STATUS.FAILED,
 			});
 
-			this._closeSocket();
+			// The socket must genuinely close here, not just be recorded as
+			// disrupted: the ReconnectionMonitor replays every subscription with
+			// its original id, and AppSync scopes ids per connection — replaying
+			// onto the still-open socket is rejected with DuplicatedOperationError.
+			this._errorDisconnect(CONTROL_MSG.TIMEOUT_DISCONNECT);
 			this.logger.debug(
 				'timeoutStartSubscription',
 				JSON.stringify({ query, variables }),
