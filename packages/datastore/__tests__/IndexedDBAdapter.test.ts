@@ -327,6 +327,77 @@ describe('IndexedDBAdapter tests', () => {
 			expect(await user!.profile).toEqual(profile);
 		});
 	});
+
+	describe('batchSave', () => {
+		let Model: PersistentModelConstructor<Model>;
+		let adapter: typeof Adapter;
+
+		beforeEach(async () => {
+			({ DataStore, Model } = getDataStore({
+				storageAdapterFactory: () => {
+					adapter = require('../src/storage/adapter/IndexedDBAdapter').default;
+
+					return adapter;
+				},
+			}));
+
+			// run one operation so the adapter is initialized
+			await DataStore.save(
+				new Model({
+					field1: 'setup',
+					dateCreated: new Date().toISOString(),
+				}),
+			);
+		});
+
+		afterEach(async () => {
+			jest.restoreAllMocks();
+			await DataStore.clear();
+		});
+
+		it('saves well-formed incoming records', async () => {
+			const item = {
+				id: '4c1ef9e3-0000-0000-0000-000000000001',
+				field1: 'incoming',
+				dateCreated: new Date().toISOString(),
+				_version: 1,
+				_lastChangedAt: 1720000000000,
+				_deleted: false,
+			} as any;
+
+			const result = await (adapter as any).batchSave(Model, [item]);
+
+			expect(result).toHaveLength(1);
+		});
+
+		it('skips a record whose keys cannot be matched after traversal instead of rejecting the whole batch', async () => {
+			const util = require('../src/util');
+			jest.spyOn(util, 'traverseModel').mockReturnValue([]);
+			const { Hub } = require('@aws-amplify/core');
+			const hubSpy = jest.spyOn(Hub, 'dispatch');
+
+			const item = {
+				id: '4c1ef9e3-0000-0000-0000-000000000002',
+				field1: 'ghost',
+				dateCreated: new Date().toISOString(),
+				_version: 1,
+				_lastChangedAt: 1720000000000,
+				_deleted: false,
+			} as any;
+
+			await expect(
+				(adapter as any).batchSave(Model, [item]),
+			).resolves.toEqual([]);
+
+			expect(hubSpy).toHaveBeenCalledWith('datastore', {
+				event: 'syncRecordSkipped',
+				data: {
+					modelName: 'Model',
+					keys: ['4c1ef9e3-0000-0000-0000-000000000002'],
+				},
+			});
+		});
+	});
 });
 
 /**

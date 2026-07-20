@@ -1,5 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+import { ConsoleLogger, Hub } from '@aws-amplify/core';
+
 import {
 	ModelInstanceMetadata,
 	ModelPredicate,
@@ -22,6 +24,8 @@ import {
 
 import AsyncStorageDatabase from './AsyncStorageDatabase';
 import { StorageAdapterBase } from './StorageAdapterBase';
+
+const logger = new ConsoleLogger('DataStore');
 
 export class AsyncStorageAdapter extends StorageAdapterBase {
 	protected db!: AsyncStorageDatabase;
@@ -83,7 +87,7 @@ export class AsyncStorageAdapter extends StorageAdapterBase {
 
 			const keyValuesPath = this.getIndexKeyValuesPath(model);
 
-			const { instance } = connectedModels.find(
+			const connectedModel = connectedModels.find(
 				({ instance: connectedModelInstance }) => {
 					const instanceKeyValuesPath = this.getIndexKeyValuesPath(
 						connectedModelInstance,
@@ -91,9 +95,24 @@ export class AsyncStorageAdapter extends StorageAdapterBase {
 
 					return keysEqual([instanceKeyValuesPath], [keyValuesPath]);
 				},
-			)!;
+			);
 
-			batch.push(instance);
+			// A malformed incoming record whose keys don't survive traversal
+			// must not reject the whole batch — skip it and keep syncing. The
+			// Hub event lets the app surface the skip to its error reporting.
+			if (!connectedModel) {
+				logger.warn(
+					`batchSave: no traversed instance matched the ${modelName} record keys; skipping record`,
+					{ keyValuesPath },
+				);
+				Hub.dispatch('datastore', {
+					event: 'syncRecordSkipped',
+					data: { modelName, keys: [keyValuesPath] },
+				});
+				continue;
+			}
+
+			batch.push(connectedModel.instance);
 		}
 
 		return this.db.batchSave(storeName, batch, keys);
