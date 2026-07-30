@@ -313,6 +313,38 @@ export abstract class AWSWebSocketProvider {
 		});
 	}
 
+	/**
+	 * Instrumentation only — no behavior change. AppSync counts a started
+	 * subscription against the connection's 200-subscription limit until a
+	 * GQL_STOP frame arrives or the socket truly closes. Every code path that
+	 * skips sending GQL_STOP while deleting local bookkeeping can therefore
+	 * orphan a server-side subscription on a long-lived socket
+	 * (MaxSubscriptionsReachedError, Sentry JAVASCRIPT-NEXTJS-2X). Dispatch a
+	 * Hub event at each skip site so the app can report which path fires and
+	 * whether the socket was really open (readyState OPEN = orphan created;
+	 * CLOSED = server cleaned up with the connection, benign).
+	 */
+	private _dispatchStopSkipped(subscriptionId: string, reason: string) {
+		try {
+			const entry = this.subscriptionObserverMap.get(subscriptionId);
+			dispatchApiEvent({
+				event: 'subscriptionStopSkipped',
+				data: {
+					reason,
+					subscriptionState: entry?.subscriptionState,
+					queryName: entry?.query?.match(/\{\s*(\w+)/)?.[1],
+					socketStatus: this.socketStatus,
+					readyState: this.awsRealTimeSocket?.readyState,
+					remainingSubscriptions: this.subscriptionObserverMap.size,
+				},
+				message: `GQL_STOP not sent for subscription (${reason})`,
+			});
+		} catch (err) {
+			// Telemetry must never break the cleanup path
+			this.logger.debug('Failed to dispatch subscriptionStopSkipped', err);
+		}
+	}
+
 	private async _cleanupSubscription(
 		subscriptionId: string,
 		reconnectSubscription: Subscription,
@@ -339,6 +371,15 @@ export abstract class AWSWebSocketProvider {
 				throw new Error('Subscription never connected');
 			}
 		} catch (err) {
+			// Two ways here: the state check above threw ('Subscription never
+			// connected'), or _waitForSubscriptionToBeConnected rejected via
+			// subscriptionFailedCallback. Either way no GQL_STOP was sent.
+			this._dispatchStopSkipped(
+				subscriptionId,
+				err instanceof Error && err.message === 'Subscription never connected'
+					? 'never-connected'
+					: 'connect-failed',
+			);
 			this.logger.debug(`Error while unsubscribing ${err}`);
 		} finally {
 			this._removeSubscriptionObserver(subscriptionId);
@@ -541,9 +582,15 @@ export abstract class AWSWebSocketProvider {
 				const unsubscribeMessage = this._unsubscribeMessage(subscriptionId);
 				const stringToAWSRealTime = JSON.stringify(unsubscribeMessage);
 				this.awsRealTimeSocket.send(stringToAWSRealTime);
+			} else {
+				// Only reached for a locally-CONNECTED subscription — the server
+				// definitely started it. If readyState is OPEN here (status flag
+				// merely stale), an orphan was just created.
+				this._dispatchStopSkipped(subscriptionId, 'socket-not-ready');
 			}
 		} catch (err) {
 			// If GQL_STOP is not sent because of disconnection issue, then there is nothing the client can do
+			this._dispatchStopSkipped(subscriptionId, 'send-failed');
 			this.logger.debug({ err });
 		}
 	}
