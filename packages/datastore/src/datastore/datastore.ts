@@ -1490,7 +1490,12 @@ class DataStore {
 		 * @param err An error to test.
 		 */
 		const handler = (err: Error) => {
-			if (err.message.startsWith('BackgroundManagerNotOpenError')) {
+			// Rejections aren't guaranteed to be Errors — a messageless value
+			// must not throw here, or the TypeError masks the original failure.
+			if (
+				typeof err?.message === 'string' &&
+				err.message.startsWith('BackgroundManagerNotOpenError')
+			) {
 				throw new Error(
 					[
 						`DataStoreStateError: Tried to execute \`${operation}\` while DataStore was "${this.state}".`,

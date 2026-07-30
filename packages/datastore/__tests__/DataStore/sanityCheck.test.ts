@@ -67,6 +67,25 @@ describe('DataStore sanity testing checks', () => {
 		);
 	});
 
+	// Regression: the handler receives whatever the wrapped process rejected
+	// with — not necessarily an Error. A messageless value used to crash the
+	// handler itself (`err.message.startsWith` → TypeError), masking the
+	// original failure. It must rethrow the original value untouched.
+	test('handleAddProcError rethrows messageless rejection values untouched', () => {
+		const handler = DataStore.handleAddProcError('DataStore.observe()');
+		const NOT_THROWN = Symbol('not thrown');
+
+		for (const nonError of [{}, undefined, null, 'string failure']) {
+			let thrown: unknown = NOT_THROWN;
+			try {
+				handler(nonError as any);
+			} catch (e) {
+				thrown = e;
+			}
+			expect(thrown).toBe(nonError);
+		}
+	});
+
 	describe('cleans up after itself', () => {
 		/**
 		 * basically, if we spin up our test contexts repeatedly, put some
