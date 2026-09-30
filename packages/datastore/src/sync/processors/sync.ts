@@ -27,6 +27,11 @@ import {
 	SchemaModel,
 } from '../../types';
 import {
+	SYNC_REQUEST_TIMEOUT_MS,
+	TransientRequestError,
+	graphqlWithTimeout,
+} from '../requestTimeout';
+import {
 	buildGraphQLOperation,
 	getClientSideAuthError,
 	getForbiddenError,
@@ -37,12 +42,6 @@ import {
 import { ModelPredicateCreator } from '../../predicates';
 
 import { getSyncErrorType } from './errorMaps';
-
-const opResultDefaults = {
-	items: [],
-	nextToken: null,
-	startedAt: null,
-};
 
 const logger = new ConsoleLogger('DataStore');
 
@@ -156,18 +155,6 @@ class SyncProcessor {
 				if (authModeAttempts >= readAuthModes.length) {
 					const authMode = readAuthModes[authModeAttempts - 1];
 					logger.debug(`Sync failed with authMode: ${authMode}`, error);
-					if (getClientSideAuthError(error) || getForbiddenError(error)) {
-						// return empty list of data so DataStore will continue to sync other models
-						logger.warn(
-							`User is unauthorized to query ${opName} with auth mode ${authMode}. No data could be returned.`,
-						);
-
-						return {
-							data: {
-								[opName]: opResultDefaults,
-							},
-						};
-					}
 					throw error;
 				}
 				logger.debug(
@@ -222,6 +209,7 @@ class SyncProcessor {
 		return jitteredExponentialRetry(
 			async (retriedQuery, retriedVariables) => {
 				try {
+					// throws `TransientRequestError` when the token is missing
 					const authToken = await getTokenForCustomAuth(
 						authMode,
 						this.amplifyConfig,
@@ -232,7 +220,8 @@ class SyncProcessor {
 						action: DataStoreAction.GraphQl,
 					};
 
-					return await this.amplifyContext.InternalAPI.graphql(
+					return await graphqlWithTimeout(
+						this.amplifyContext.InternalAPI,
 						{
 							query: retriedQuery,
 							variables: retriedVariables,
@@ -241,17 +230,32 @@ class SyncProcessor {
 						},
 						undefined,
 						customUserAgentDetails,
+						{ timeoutMs: SYNC_REQUEST_TIMEOUT_MS, onStop: onTerminate },
 					);
-
-					// TODO: onTerminate.then(() => API.cancel(...))
 				} catch (error) {
-					// Catch client-side (GraphQLAuthError) & 401/403 errors here so that we don't continue to retry
-					const clientOrForbiddenErrorMessage =
-						getClientSideAuthError(error) || getForbiddenError(error);
+					if (error instanceof TransientRequestError) {
+						// a transport failure, not an answer: retry with backoff
+						throw error;
+					}
 
-					if (clientOrForbiddenErrorMessage) {
-						logger.error('Sync processor retry error:', error);
-						throw new NonRetryableError(clientOrForbiddenErrorMessage);
+					// A client-side auth error from the API layer means the auth
+					// config is missing (an empty lambda token is thrown as
+					// `TransientRequestError` above, before the request). That is
+					// definitive for this round: the caller reports it.
+					const clientSideAuthErrorMessage = getClientSideAuthError(error);
+					if (clientSideAuthErrorMessage) {
+						logger.error('Sync processor auth config error:', error);
+						throw new NonRetryableError(clientSideAuthErrorMessage);
+					}
+
+					// A token the service rejected (401) or a forbidden request
+					// (403) is not an answer about the data. Every model uses
+					// custom (lambda) auth, so the token is expected to work
+					// again: retry with backoff.
+					const forbiddenErrorMessage = getForbiddenError(error);
+					if (forbiddenErrorMessage) {
+						logger.warn('Sync request not authorized, retrying:', error);
+						throw new TransientRequestError(forbiddenErrorMessage);
 					}
 
 					const hasItems = Boolean(error?.data?.[opName]?.items);
@@ -441,6 +445,17 @@ class SyncProcessor {
 											onTerminate,
 										));
 									} catch (error) {
+										/**
+										 * The sync processor was stopped while the request was in
+										 * flight (`DataStore.clear()`, for example). The local store
+										 * is being torn down: do not report, do not emit the page.
+										 */
+										if (!this.runningProcesses.isOpen) {
+											resolve();
+
+											return;
+										}
+
 										try {
 											// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression
 											await this.errorHandler({
@@ -464,9 +479,27 @@ class SyncProcessor {
 										 * with no items and allow the loop to continue organically. This ensures
 										 * all callbacks (subscription messages) happen as normal, so anything
 										 * waiting on them knows the model is as done as it can be.
+										 *
+										 * `nextToken` is cleared so that a failing page 2+ is not
+										 * requested again for ever. `startedAt` is cleared so that
+										 * `lastSync` stays unset and the next round fetches the
+										 * model again from the start.
 										 */
 										done = true;
 										items = [];
+										nextToken = null!;
+										startedAt = null!;
+									}
+
+									/**
+									 * The sync processor was stopped while the request was in
+									 * flight (a request that timed out, for example). The local
+									 * store is being torn down: do not emit the page.
+									 */
+									if (!this.runningProcesses.isOpen) {
+										resolve();
+
+										return;
 									}
 
 									recordsReceived += items.length;

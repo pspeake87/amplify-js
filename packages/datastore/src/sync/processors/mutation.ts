@@ -9,11 +9,10 @@ import {
 	DataStoreAction,
 	GraphQLAuthMode,
 	NonRetryableError,
-	jitteredBackoff,
 	retry,
 } from '@aws-amplify/core/internals/utils';
 import { Observable, Observer } from 'rxjs';
-import { ConsoleLogger } from '@aws-amplify/core';
+import { ConsoleLogger, Hub } from '@aws-amplify/core';
 
 import { MutationEvent } from '../';
 import { ModelInstanceCreator } from '../../datastore/datastore';
@@ -39,16 +38,34 @@ import {
 import { ID, USER, extractTargetNamesFromSrc } from '../../util';
 import { MutationEventOutbox } from '../outbox';
 import {
+	MUTATION_REQUEST_TIMEOUT_MS,
+	TransientRequestError,
+	graphqlWithTimeout,
+} from '../requestTimeout';
+import {
 	TransformerMutationType,
 	buildGraphQLOperation,
 	createMutationInstanceFromModelOperation,
 	getModelAuthModes,
 	getTokenForCustomAuth,
+	resolveServiceErrorStatusCode,
 } from '../utils';
 
 import { getMutationErrorType } from './errorMaps';
 
 const MAX_ATTEMPTS = 10;
+
+/**
+ * Longest wait between two attempts to send the head of the outbox. Short
+ * enough that a write goes out soon after the network or the token returns.
+ */
+export const MAX_RETRY_DELAY_MS = 30 * 1000;
+
+/**
+ * After this long of failed attempts for one event, `outboxHeadStuck` is
+ * dispatched on the `datastore` Hub channel one time for that event.
+ */
+export const OUTBOX_HEAD_STUCK_AFTER_MS = 5 * 60 * 1000;
 
 const logger = new ConsoleLogger('DataStore');
 
@@ -75,6 +92,47 @@ class MutationProcessor {
 	>();
 
 	private processing = false;
+
+	/**
+	 * Identifies the current `resume()` loop. A loop that finds a different
+	 * value has been superseded (pause / restart) and must exit without
+	 * touching the outbox.
+	 */
+	private loopGeneration = 0;
+
+	/**
+	 * The mutation event an `Unauthorized` (HTTP 401) rejection was last
+	 * reported for, so the error handler is called one time per event.
+	 */
+	private unauthorizedReportedFor?: string;
+
+	/**
+	 * Failed attempts for the event at the head of the outbox. Reset when an
+	 * attempt succeeds or the head changes.
+	 */
+	private headFailures?: {
+		id: string;
+		since: number;
+		attempts: number;
+		stuckReported: boolean;
+	};
+
+	/**
+	 * Wakes the current loop out of a retry delay when it is superseded.
+	 */
+	private supersedeCurrentLoop?: () => void;
+
+	/**
+	 * True while the current loop waits between two attempts. A new save
+	 * supersedes such a loop so that the write is tried at once.
+	 */
+	private retrySleeping = false;
+
+	/**
+	 * Settles when the most recently started loop has exited. A new loop waits
+	 * for it, so two loops never send at the same time.
+	 */
+	private lastLoopDone: Promise<void> = Promise.resolve();
 
 	private runningProcesses = new BackgroundProcessManager();
 
@@ -132,6 +190,8 @@ class MutationProcessor {
 
 	public start(): Observable<MutationProcessorEvent> {
 		this.runningProcesses = new BackgroundProcessManager();
+		// a loop that belongs to the previous process manager must not continue
+		this.pause();
 
 		const observable = new Observable<MutationProcessorEvent>(observer => {
 			this.observer = observer;
@@ -167,6 +227,12 @@ class MutationProcessor {
 	public async resume(): Promise<void> {
 		if (this.runningProcesses.isOpen) {
 			await this.runningProcesses.add(async onTerminate => {
+				if (this.processing && this.retrySleeping) {
+					// A loop that waits out a retry delay is superseded: the new
+					// loop tries the head at once (a new save, a token that works
+					// again, or a reconnect must not wait up to MAX_RETRY_DELAY_MS).
+					this.pause();
+				}
 				if (
 					this.processing ||
 					!this.isReady() ||
@@ -175,138 +241,257 @@ class MutationProcessor {
 					return;
 				}
 				this.processing = true;
-				let head: MutationEvent;
-				const namespaceName = USER;
+				const generation = ++this.loopGeneration;
+				const isCurrentLoop = () =>
+					this.processing && generation === this.loopGeneration;
+				const superseded = new Promise<void>(resolve => {
+					this.supersedeCurrentLoop = resolve;
+				});
+				const onLoopEnd = Promise.race([onTerminate, superseded]);
 
-				// start to drain outbox
-				while (
-					this.processing &&
-					this.runningProcesses.isOpen &&
-					(head = await this.outbox.peek(this.storage)) !== undefined
-				) {
-					const { model, operation, data, condition } = head;
-					const modelConstructor = this.userClasses[
-						model
-					] as PersistentModelConstructor<MutationEvent>;
-					let result: GraphQLResult<Record<string, PersistentModel>> =
-						undefined!;
-					let opName: string = undefined!;
-					let modelDefinition: SchemaModel = undefined!;
+				const previousLoopDone = this.lastLoopDone;
+				let signalLoopDone!: () => void;
+				this.lastLoopDone = new Promise<void>(resolve => {
+					signalLoopDone = resolve;
+				});
 
-					try {
-						const modelAuthModes = await getModelAuthModes({
-							authModeStrategy: this.authModeStrategy,
-							defaultAuthMode:
-								this.amplifyConfig.aws_appsync_authenticationType,
-							modelName: model,
-							schema: this.schema,
-						});
-
-						const operationAuthModes = modelAuthModes[operation.toUpperCase()];
-
-						let authModeAttempts = 0;
-						const authModeRetry = async () => {
-							try {
-								logger.debug(
-									`Attempting mutation with authMode: ${operationAuthModes[authModeAttempts]}`,
-								);
-								const response = await this.jitteredRetry(
-									namespaceName,
-									model,
-									operation,
-									data,
-									condition,
-									modelConstructor,
-									this._MutationEvent,
-									head,
-									operationAuthModes[authModeAttempts],
-									onTerminate,
-								);
-
-								logger.debug(
-									`Mutation sent successfully with authMode: ${operationAuthModes[authModeAttempts]}`,
-								);
-
-								return response;
-							} catch (error) {
-								authModeAttempts++;
-								if (authModeAttempts >= operationAuthModes.length) {
-									logger.debug(
-										`Mutation failed with authMode: ${
-											operationAuthModes[authModeAttempts - 1]
-										}`,
-									);
-									try {
-										// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression
-										await this.errorHandler({
-											recoverySuggestion:
-												'Ensure app code is up to date, auth directives exist and are correct on each model, and that server-side data has not been invalidated by a schema change. If the problem persists, search for or create an issue: https://github.com/aws-amplify/amplify-js/issues',
-											localModel: null!,
-											message: error.message,
-											model: modelConstructor.name,
-											operation: opName,
-											errorType: getMutationErrorType(error),
-											process: ProcessName.sync,
-											remoteModel: null!,
-											cause: error,
-										});
-									} catch (e) {
-										logger.error('Mutation error handler failed with:', e);
-									}
-									throw error;
-								}
-								logger.debug(
-									`Mutation failed with authMode: ${
-										operationAuthModes[authModeAttempts - 1]
-									}. Retrying with authMode: ${
-										operationAuthModes[authModeAttempts]
-									}`,
-								);
-
-								return authModeRetry();
-							}
-						};
-
-						[result, opName, modelDefinition] = await authModeRetry();
-					} catch (error) {
-						if (
-							error.message === 'Offline' ||
-							error.message === 'RetryMutation'
-						) {
-							continue;
-						}
-					}
-
-					if (result === undefined) {
-						logger.debug('done retrying');
-						await this.storage.runExclusive(async storage => {
-							await this.outbox.dequeue(storage);
-						});
-						continue;
-					}
-
-					const record = result.data![opName!];
-					let hasMore = false;
-
-					await this.storage.runExclusive(async storage => {
-						// using runExclusive to prevent possible race condition
-						// when another record gets enqueued between dequeue and peek
-						await this.outbox.dequeue(storage, record, operation);
-						hasMore = (await this.outbox.peek(storage)) !== undefined;
-					});
-
-					this.observer?.next?.({
-						operation,
-						modelDefinition,
-						model: record,
-						hasMore,
-					});
+				try {
+					// A superseded loop can still have one request in flight (at most
+					// MUTATION_REQUEST_TIMEOUT_MS). Let it finish before sending, so
+					// that one write is never in flight two times.
+					await previousLoopDone;
+					await this.drainOutbox(
+						generation,
+						isCurrentLoop,
+						onLoopEnd,
+						onTerminate,
+					);
+				} finally {
+					signalLoopDone();
 				}
-
-				// pauses itself
-				this.pause();
 			}, 'mutation resume loop');
 		}
+	}
+
+	/**
+	 * @param onLoopEnd resolves when the loop is superseded or stopped: a
+	 * retry delay ends early
+	 * @param onStop resolves when the processor stops: an in-flight request
+	 * is cancelled. A superseded loop lets its request finish.
+	 */
+	private async drainOutbox(
+		generation: number,
+		isCurrentLoop: () => boolean,
+		onLoopEnd: Promise<void>,
+		onStop: Promise<void>,
+	): Promise<void> {
+		let head: MutationEvent;
+		const namespaceName = USER;
+
+		// start to drain outbox
+		while (
+			isCurrentLoop() &&
+			this.runningProcesses.isOpen &&
+			(head = await this.outbox.peek(this.storage)) !== undefined
+		) {
+			const { model, operation, data, condition } = head;
+			const modelConstructor = this.userClasses[
+				model
+			] as PersistentModelConstructor<MutationEvent>;
+			let result: GraphQLResult<Record<string, PersistentModel>> = undefined!;
+			let opName: string = undefined!;
+			let modelDefinition: SchemaModel = undefined!;
+
+			try {
+				const modelAuthModes = await getModelAuthModes({
+					authModeStrategy: this.authModeStrategy,
+					defaultAuthMode: this.amplifyConfig.aws_appsync_authenticationType,
+					modelName: model,
+					schema: this.schema,
+				});
+
+				const operationAuthModes = modelAuthModes[operation.toUpperCase()];
+
+				let authModeAttempts = 0;
+				const authModeRetry = async () => {
+					try {
+						logger.debug(
+							`Attempting mutation with authMode: ${operationAuthModes[authModeAttempts]}`,
+						);
+						const response = await this.jitteredRetry(
+							namespaceName,
+							model,
+							operation,
+							data,
+							condition,
+							modelConstructor,
+							this._MutationEvent,
+							head,
+							operationAuthModes[authModeAttempts],
+							onLoopEnd,
+							onStop,
+							isCurrentLoop,
+						);
+
+						logger.debug(
+							`Mutation sent successfully with authMode: ${operationAuthModes[authModeAttempts]}`,
+						);
+
+						return response;
+					} catch (error) {
+						if (error === undefined || error instanceof TransientRequestError) {
+							// Retries were terminated (stop / pause) while the
+							// transport was failing, or before the first attempt.
+							// The write stays in the outbox.
+							throw new TransientRequestError();
+						}
+						authModeAttempts++;
+						if (authModeAttempts >= operationAuthModes.length) {
+							logger.debug(
+								`Mutation failed with authMode: ${
+									operationAuthModes[authModeAttempts - 1]
+								}`,
+							);
+							try {
+								// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression
+								await this.errorHandler({
+									recoverySuggestion:
+										'Ensure app code is up to date, auth directives exist and are correct on each model, and that server-side data has not been invalidated by a schema change. If the problem persists, search for or create an issue: https://github.com/aws-amplify/amplify-js/issues',
+									localModel: null!,
+									message: error.message,
+									model: modelConstructor.name,
+									operation: opName,
+									errorType: getMutationErrorType(error),
+									process: ProcessName.sync,
+									remoteModel: null!,
+									cause: error,
+								});
+							} catch (e) {
+								logger.error('Mutation error handler failed with:', e);
+							}
+							throw error;
+						}
+						logger.debug(
+							`Mutation failed with authMode: ${
+								operationAuthModes[authModeAttempts - 1]
+							}. Retrying with authMode: ${
+								operationAuthModes[authModeAttempts]
+							}`,
+						);
+
+						return authModeRetry();
+					}
+				};
+
+				[result, opName, modelDefinition] = await authModeRetry();
+			} catch (error) {
+				if (
+					error instanceof TransientRequestError ||
+					error?.message === 'RetryMutation'
+				) {
+					// Not a definitive answer: the write stays in the outbox.
+					continue;
+				}
+			}
+
+			// A definitive answer removes the event, also when this loop was
+			// superseded meanwhile: the next loop must not send it again.
+			const sentId = head.id;
+
+			if (result === undefined) {
+				logger.debug('done retrying');
+				await this.storage.runExclusive(async storage => {
+					await this.outbox.dequeue(storage, undefined, undefined, sentId);
+				});
+				continue;
+			}
+
+			const record = result.data![opName!];
+			let hasMore = false;
+			let dequeued: MutationEvent | undefined;
+
+			await this.storage.runExclusive(async storage => {
+				// using runExclusive to prevent possible race condition
+				// when another record gets enqueued between dequeue and peek
+				dequeued = await this.outbox.dequeue(
+					storage,
+					record,
+					operation,
+					sentId,
+				);
+				hasMore = (await this.outbox.peek(storage)) !== undefined;
+			});
+
+			if (!dequeued) {
+				// another tab already removed this event
+				continue;
+			}
+
+			this.observer?.next?.({
+				operation,
+				modelDefinition,
+				model: record,
+				hasMore,
+			});
+		}
+
+		// pauses itself, unless a newer loop has taken over
+		if (generation === this.loopGeneration) {
+			this.pause();
+		}
+	}
+
+	/**
+	 * A failure that says nothing definitive about the record: the transport
+	 * failed, the request timed out or was cancelled, no token was available,
+	 * or the service rejected the request before the resolver ran (401, 429,
+	 * 5xx). Such a write must stay in the outbox.
+	 */
+	private isRetryableMutationError(err: any): boolean {
+		if (err instanceof TransientRequestError) {
+			return true;
+		}
+		if (!err?.errors || err.errors.length === 0) {
+			// client-side errors that don't come back in the `GraphQLError`
+			// format, `NoAuthorizationHeader` (empty token) included
+			return true;
+		}
+
+		const [error] = err.errors;
+		const { originalError } = error;
+
+		if (
+			error.message === 'Network Error' ||
+			error.message === 'A network error has occurred.' ||
+			originalError?.name === 'NetworkError' ||
+			originalError?.code === 'ERR_NETWORK' // refers to axios timeout error caused by device's bad network condition
+		) {
+			return true;
+		}
+
+		if (this.isUnauthorizedException(error)) {
+			return true;
+		}
+
+		const status = resolveServiceErrorStatusCode(originalError);
+
+		return (
+			status === 429 || (status !== null && status >= 500 && status <= 599)
+		);
+	}
+
+	/**
+	 * HTTP 401 from the service (token rejected), as opposed to the
+	 * `Unauthorized` errorType a resolver returns for a specific record.
+	 */
+	private isUnauthorizedException(error: any): boolean {
+		return (
+			error?.errorType === 'UnauthorizedException' ||
+			Boolean(
+				error?.originalError?.name?.startsWith?.('UnauthorizedException'),
+			) ||
+			resolveServiceErrorStatusCode(error?.originalError) === 401
+		);
 	}
 
 	private async jitteredRetry(
@@ -319,10 +504,26 @@ class MutationProcessor {
 		MutationEventCtor: PersistentModelConstructor<MutationEvent>,
 		mutationEvent: MutationEvent,
 		authMode: GraphQLAuthMode,
-		onTerminate: Promise<void>,
+		onLoopEnd: Promise<void>,
+		onStop: Promise<void>,
+		isCurrentLoop: () => boolean,
 	): Promise<
 		[GraphQLResult<Record<string, PersistentModel>>, string, SchemaModel]
 	> {
+		/**
+		 * Waits between two attempts, for ever, unless the loop was
+		 * superseded or stopped. Only `TransientRequestError` reaches this
+		 * function: every other failure is a definitive answer.
+		 */
+		const delayBetweenAttempts = (attempt: number): number | false => {
+			if (!isCurrentLoop()) {
+				return false;
+			}
+			this.retrySleeping = true;
+
+			return mutationRetryDelay(attempt);
+		};
+
 		return retry(
 			async (
 				retriedModel: string,
@@ -342,10 +543,27 @@ class MutationProcessor {
 						retriedCondition,
 					);
 
-				const authToken = await getTokenForCustomAuth(
-					authMode,
-					this.amplifyConfig,
-				);
+				this.retrySleeping = false;
+
+				// Keeps the write in the outbox. `delayBetweenAttempts` ends the
+				// retries when the loop is no longer current.
+				const keepAndRetry = (cause?: unknown) => {
+					this.noteHeadFailure(retiredMutationEvent, cause);
+
+					return new TransientRequestError();
+				};
+
+				if (!isCurrentLoop()) {
+					throw new TransientRequestError();
+				}
+
+				let authToken: string | undefined;
+				try {
+					authToken = await getTokenForCustomAuth(authMode, this.amplifyConfig);
+				} catch (tokenError) {
+					logger.warn('Mutation token retrieval failed', tokenError);
+					throw keepAndRetry(tokenError);
+				}
 
 				const tryWith = {
 					query,
@@ -364,150 +582,193 @@ class MutationProcessor {
 
 				do {
 					try {
-						const result = (await this.amplifyContext.InternalAPI.graphql(
+						const result = (await graphqlWithTimeout(
+							this.amplifyContext.InternalAPI,
 							tryWith,
 							undefined,
 							customUserAgentDetails,
+							{ timeoutMs: MUTATION_REQUEST_TIMEOUT_MS, onStop },
 						)) as GraphQLResult<Record<string, PersistentModel>>;
+
+						this.unauthorizedReportedFor = undefined;
+						this.headFailures = undefined;
 
 						// Use `as any` because TypeScript doesn't seem to like passing tuples
 						// through generic params.
 						return [result, opName, modelDefinition] as any;
 					} catch (err) {
-						if (err.errors && err.errors.length > 0) {
-							const [error] = err.errors;
-							const { originalError: { code = null } = {} } = error;
-
-							if (error.errorType === 'Unauthorized') {
-								throw new NonRetryableError('Unauthorized');
-							}
-
+						if (this.isRetryableMutationError(err)) {
+							const [unauthorized] = err?.errors ?? [];
 							if (
-								error.message === 'Network Error' ||
-								code === 'ERR_NETWORK' // refers to axios timeout error caused by device's bad network condition
+								unauthorized &&
+								this.isUnauthorizedException(unauthorized) &&
+								this.unauthorizedReportedFor !== retiredMutationEvent.id
 							) {
-								if (!this.processing) {
-									throw new NonRetryableError('Offline');
-								}
-								// TODO: Check errors on different env (react-native or other browsers)
-								throw new Error('Network Error');
-							}
-
-							if (error.errorType === 'ConflictUnhandled') {
-								// TODO: add on ConflictConditionalCheck error query last from server
-								attempt++;
-								let retryWith: PersistentModel | typeof DISCARD;
-
-								if (attempt > MAX_ATTEMPTS) {
-									retryWith = DISCARD;
-								} else {
-									try {
-										retryWith = await this.conflictHandler!({
-											modelConstructor: retriedModelConstructor,
-											localModel: this.modelInstanceCreator(
-												retriedModelConstructor,
-												variables.input,
-											),
-											remoteModel: this.modelInstanceCreator(
-												retriedModelConstructor,
-												error.data,
-											),
-											operation: opType,
-											attempts: attempt,
-										});
-									} catch (caughtErr) {
-										logger.warn('conflict trycatch', caughtErr);
-										continue;
-									}
-								}
-
-								if (retryWith === DISCARD) {
-									// Query latest from server and notify merger
-
-									const [[, builtOpName, builtQuery]] = buildGraphQLOperation(
-										this.schema.namespaces[namespaceName],
-										modelDefinition,
-										'GET',
-									);
-
-									const newAuthToken = await getTokenForCustomAuth(
-										authMode,
-										this.amplifyConfig,
-									);
-
-									const serverData =
-										(await this.amplifyContext.InternalAPI.graphql(
-											{
-												query: builtQuery,
-												variables: { id: variables.input.id },
-												authMode,
-												authToken: newAuthToken,
-											},
-											undefined,
-											customUserAgentDetails,
-										)) as GraphQLResult<Record<string, PersistentModel>>;
-
-									// onTerminate cancel graphql()
-
-									return [serverData, builtOpName, modelDefinition];
-								}
-
-								const namespace = this.schema.namespaces[namespaceName];
-
-								// convert retry with to tryWith
-								const updatedMutation =
-									createMutationInstanceFromModelOperation(
-										namespace.relationships!,
-										modelDefinition,
-										opType,
-										retriedModelConstructor,
-										retryWith,
-										graphQLCondition,
-										retiredMutationEventCtor,
-										this.modelInstanceCreator,
-										retiredMutationEvent.id,
-									);
-
-								await this.storage.save(updatedMutation);
-
-								throw new NonRetryableError('RetryMutation');
-							} else {
+								this.unauthorizedReportedFor = retiredMutationEvent.id;
 								try {
+									// `localModel` is null on purpose: a report that carries
+									// the record means "the server rejected and dropped this
+									// change" to the apps. This write is kept and sent later.
 									this.errorHandler({
 										recoverySuggestion:
-											'Ensure app code is up to date, auth directives exist and are correct on each model, and that server-side data has not been invalidated by a schema change. If the problem persists, search for or create an issue: https://github.com/aws-amplify/amplify-js/issues',
-										localModel: variables.input,
-										message: error.message,
+											'Ensure the auth token is valid. The mutation stays in the outbox and is retried.',
+										localModel: null!,
+										message: unauthorized.message,
 										operation: retriedOperation,
-										errorType: getMutationErrorType(error),
-										errorInfo: error.errorInfo,
+										errorType: 'Unauthorized',
 										process: ProcessName.mutate,
-										cause: error,
-										remoteModel: error.data
-											? this.modelInstanceCreator(
-													retriedModelConstructor,
-													error.data,
-												)
-											: null!,
+										cause: unauthorized,
+										remoteModel: null!,
 									});
 								} catch (caughtErr) {
 									logger.warn('Mutation error handler failed with:', caughtErr);
-								} finally {
-									// Return empty tuple, dequeues the mutation
-									// eslint-disable-next-line no-unsafe-finally
-									return error.data
-										? [
-												{ data: { [opName]: error.data } },
-												opName,
-												modelDefinition,
-											]
-										: [];
 								}
 							}
-						} else {
-							// Catch-all for client-side errors that don't come back in the `GraphQLError` format.
-							// These errors should not be retried.
-							throw new NonRetryableError(err);
+
+							throw keepAndRetry(err);
+						}
+
+						// `isRetryableMutationError` keeps every error that does not
+						// come back in the `GraphQLError` format.
+						const [error] = err.errors;
+
+						if (error.errorType === 'Unauthorized') {
+							throw new NonRetryableError('Unauthorized');
+						}
+
+						if (
+							retriedOperation === TransformerMutationType.CREATE &&
+							isConditionalCheckFailure(error)
+						) {
+							// The record exists on the server already: a previous
+							// attempt was applied, but its response was lost or cut
+							// off. Read the record back so that the dequeue learns
+							// its `_version` and later updates of the record carry it.
+							const serverRecord = await this.readBack(
+								namespaceName,
+								modelDefinition,
+								variables.input,
+								authMode,
+								customUserAgentDetails,
+								onStop,
+							);
+
+							if (serverRecord) {
+								this.unauthorizedReportedFor = undefined;
+								this.headFailures = undefined;
+
+								return [
+									{ data: { [opName]: serverRecord } },
+									opName,
+									modelDefinition,
+								] as any;
+							}
+						}
+
+						if (error.errorType === 'ConflictUnhandled') {
+							// TODO: add on ConflictConditionalCheck error query last from server
+							attempt++;
+							let retryWith: PersistentModel | typeof DISCARD;
+
+							if (attempt > MAX_ATTEMPTS) {
+								retryWith = DISCARD;
+							} else {
+								try {
+									retryWith = await this.conflictHandler!({
+										modelConstructor: retriedModelConstructor,
+										localModel: this.modelInstanceCreator(
+											retriedModelConstructor,
+											variables.input,
+										),
+										remoteModel: this.modelInstanceCreator(
+											retriedModelConstructor,
+											error.data,
+										),
+										operation: opType,
+										attempts: attempt,
+									});
+								} catch (caughtErr) {
+									logger.warn('conflict trycatch', caughtErr);
+									continue;
+								}
+							}
+
+							if (retryWith === DISCARD) {
+								// Query latest from server and notify merger
+
+								const [[, builtOpName, builtQuery]] = buildGraphQLOperation(
+									this.schema.namespaces[namespaceName],
+									modelDefinition,
+									'GET',
+								);
+
+								const newAuthToken = await getTokenForCustomAuth(
+									authMode,
+									this.amplifyConfig,
+								);
+
+								const serverData = (await graphqlWithTimeout(
+									this.amplifyContext.InternalAPI,
+									{
+										query: builtQuery,
+										variables: { id: variables.input.id },
+										authMode,
+										authToken: newAuthToken,
+									},
+									undefined,
+									customUserAgentDetails,
+									{ timeoutMs: MUTATION_REQUEST_TIMEOUT_MS, onStop },
+								)) as GraphQLResult<Record<string, PersistentModel>>;
+
+								return [serverData, builtOpName, modelDefinition];
+							}
+
+							const namespace = this.schema.namespaces[namespaceName];
+
+							// convert retry with to tryWith
+							const updatedMutation = createMutationInstanceFromModelOperation(
+								namespace.relationships!,
+								modelDefinition,
+								opType,
+								retriedModelConstructor,
+								retryWith,
+								graphQLCondition,
+								retiredMutationEventCtor,
+								this.modelInstanceCreator,
+								retiredMutationEvent.id,
+							);
+
+							await this.storage.save(updatedMutation);
+
+							throw new NonRetryableError('RetryMutation');
+						}
+
+						try {
+							this.errorHandler({
+								recoverySuggestion:
+									'Ensure app code is up to date, auth directives exist and are correct on each model, and that server-side data has not been invalidated by a schema change. If the problem persists, search for or create an issue: https://github.com/aws-amplify/amplify-js/issues',
+								localModel: variables.input,
+								message: error.message,
+								operation: retriedOperation,
+								errorType: getMutationErrorType(error),
+								errorInfo: error.errorInfo,
+								process: ProcessName.mutate,
+								cause: error,
+								remoteModel: error.data
+									? this.modelInstanceCreator(
+											retriedModelConstructor,
+											error.data,
+										)
+									: null!,
+							});
+						} catch (caughtErr) {
+							logger.warn('Mutation error handler failed with:', caughtErr);
+						} finally {
+							// Return empty tuple, dequeues the mutation
+							// eslint-disable-next-line no-unsafe-finally
+							return error.data
+								? [{ data: { [opName]: error.data } }, opName, modelDefinition]
+								: [];
 						}
 					}
 					// eslint-disable-next-line no-unmodified-loop-condition
@@ -522,9 +783,93 @@ class MutationProcessor {
 				MutationEventCtor,
 				mutationEvent,
 			],
-			safeJitteredBackoff,
-			onTerminate,
+			delayBetweenAttempts,
+			onLoopEnd,
 		);
+	}
+
+	/**
+	 * GETs a record from the server. Returns `undefined` when the record is
+	 * absent or deleted. Throws `TransientRequestError` when the read failed.
+	 */
+	private async readBack(
+		namespaceName: string,
+		modelDefinition: SchemaModel,
+		input: ModelInstanceMetadata,
+		authMode: GraphQLAuthMode,
+		customUserAgentDetails: CustomUserAgentDetails,
+		onStop: Promise<void>,
+	): Promise<PersistentModel | undefined> {
+		const [[, opName, query]] = buildGraphQLOperation(
+			this.schema.namespaces[namespaceName],
+			modelDefinition,
+			'GET',
+		);
+		const { primaryKey } =
+			this.schema.namespaces[namespaceName].keys![modelDefinition.name];
+		const variables = {};
+		for (const pkField of primaryKey?.length ? primaryKey : [ID]) {
+			variables[pkField] = input[pkField];
+		}
+
+		let response: GraphQLResult<Record<string, PersistentModel>>;
+		try {
+			const authToken = await getTokenForCustomAuth(
+				authMode,
+				this.amplifyConfig,
+			);
+			response = await graphqlWithTimeout(
+				this.amplifyContext.InternalAPI,
+				{ query, variables, authMode, authToken },
+				undefined,
+				customUserAgentDetails,
+				{ timeoutMs: MUTATION_REQUEST_TIMEOUT_MS, onStop },
+			);
+		} catch (error) {
+			logger.warn('Read-back of an existing record failed', error);
+			throw new TransientRequestError();
+		}
+
+		const record = response?.data?.[opName];
+
+		return record && !record._deleted ? record : undefined;
+	}
+
+	/**
+	 * Counts a failed attempt for the head of the outbox. When the head has
+	 * failed for `OUTBOX_HEAD_STUCK_AFTER_MS`, dispatches `outboxHeadStuck`
+	 * one time so that the app can tell the user that a change is waiting.
+	 */
+	private noteHeadFailure(mutationEvent: MutationEvent, cause: unknown) {
+		const now = Date.now();
+		if (this.headFailures?.id !== mutationEvent.id) {
+			this.headFailures = {
+				id: mutationEvent.id,
+				since: now,
+				attempts: 0,
+				stuckReported: false,
+			};
+		}
+		const failures = this.headFailures;
+		failures.attempts++;
+
+		if (
+			!failures.stuckReported &&
+			now - failures.since >= OUTBOX_HEAD_STUCK_AFTER_MS
+		) {
+			failures.stuckReported = true;
+			Hub.dispatch('datastore', {
+				event: 'outboxHeadStuck',
+				data: {
+					model: mutationEvent.model,
+					operation: mutationEvent.operation,
+					modelId: mutationEvent.modelId,
+					attempts: failures.attempts,
+					since: failures.since,
+					cause,
+				},
+			});
+		}
 	}
 
 	private createQueryVariables(
@@ -661,43 +1006,34 @@ class MutationProcessor {
 
 	public pause() {
 		this.processing = false;
+		this.retrySleeping = false;
+		this.loopGeneration++;
+		this.supersedeCurrentLoop?.();
+		this.supersedeCurrentLoop = undefined;
 	}
 }
 
-const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
-const originalJitteredBackoff = jitteredBackoff(MAX_RETRY_DELAY_MS);
+/**
+ * DynamoDB refused the write because its condition failed. For a CREATE that
+ * means the record exists already.
+ */
+const isConditionalCheckFailure = (error: any): boolean =>
+	String(error?.errorType ?? '').includes('ConditionalCheckFailedException') ||
+	/^The conditional request failed/.test(String(error?.message ?? ''));
 
 /**
- * @private
- * Internal use of Amplify only.
- *
- * Wraps the jittered backoff calculation to retry Network Errors indefinitely.
- * Backs off according to original jittered retry logic until the original retry
- * logic hits its max. After this occurs, if the error is a Network Error, we
- * ignore the attempt count and return MAX_RETRY_DELAY_MS to retry forever (until
- * the request succeeds).
- *
- * @param attempt ignored
- * @param _args ignored
- * @param error tested to see if `.message` is 'Network Error'
- * @returns number | false :
+ * Wait before attempt `attempt + 1`: exponential with jitter, never more
+ * than `MAX_RETRY_DELAY_MS`, never `false` (a kept write is retried for
+ * ever, until the loop is superseded or stopped).
  */
-export const safeJitteredBackoff: typeof originalJitteredBackoff = (
-	attempt,
-	_args,
-	error,
-) => {
-	const attemptResult = originalJitteredBackoff(attempt);
+export const mutationRetryDelay = (attempt: number): number => {
+	const BASE_TIME_MS = 100;
+	const JITTER_MS = 100;
 
-	// If this is the last attempt and it is a network error, we retry indefinitively every 5 minutes
-	if (
-		attemptResult === false &&
-		((error || {}) as any).message === 'Network Error'
-	) {
-		return MAX_RETRY_DELAY_MS;
-	}
-
-	return attemptResult;
+	return Math.min(
+		2 ** attempt * BASE_TIME_MS + JITTER_MS * Math.random(),
+		MAX_RETRY_DELAY_MS,
+	);
 };
 
 export { MutationProcessor };

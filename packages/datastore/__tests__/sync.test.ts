@@ -208,36 +208,35 @@ describe('Sync', () => {
 			}
 		});
 
-		it('should return NonRetryableError for 403 error', async () => {
-			const rejectResponse = {
-				data: null,
-				errors: [
-					{
-						originalError: {
-							$metadata: {
-								httpStatusCode: 403,
+		[401, 403].forEach(status => {
+			it(`should retry (TransientRequestError) for HTTP ${status}: the token is expected to work again`, async () => {
+				const rejectResponse = {
+					data: null,
+					errors: [
+						{
+							originalError: {
+								$metadata: {
+									httpStatusCode: status,
+								},
 							},
 						},
-					},
-				],
-			};
+					],
+				};
 
-			const SyncProcessor = jitteredRetrySyncProcessorSetup({
-				rejectResponse,
-			});
-
-			try {
-				await SyncProcessor.jitteredRetry({
-					query: defaultQuery,
-					variables: defaultVariables,
-					opName: defaultOpName,
-					modelDefinition: defaultModelDefinition,
-					authMode: defaultAuthMode,
+				const SyncProcessor = jitteredRetrySyncProcessorSetup({
+					rejectResponse,
 				});
-			} catch (e) {
-				// NonRetryableError has a `nonRetryable` property
-				expect(e).toHaveProperty('nonRetryable');
-			}
+
+				await expect(
+					SyncProcessor.jitteredRetry({
+						query: defaultQuery,
+						variables: defaultVariables,
+						opName: defaultOpName,
+						modelDefinition: defaultModelDefinition,
+						authMode: defaultAuthMode,
+					}),
+				).rejects.toMatchObject({ name: 'TransientRequestError' });
+			});
 		});
 
 		[

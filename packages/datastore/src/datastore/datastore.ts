@@ -53,6 +53,7 @@ import {
 	PersistentModel,
 	PersistentModelConstructor,
 	PersistentModelMetaData,
+	ProcessName,
 	ProducerPaginationInput,
 	RecursiveModelPredicateExtender,
 	Schema,
@@ -1598,7 +1599,24 @@ class DataStore {
 								});
 							},
 							error: err => {
+								// The sync engine stops for good here and nothing restarts
+								// it. The app must hear about it, not only the console.
 								logger.warn('Sync error', err);
+								try {
+									this.errorHandler({
+										recoverySuggestion:
+											'The sync engine stopped. Reload the page to start it again.',
+										localModel: null!,
+										message: `Sync engine stopped: ${err?.message ?? err}`,
+										operation: 'syncEngine',
+										errorType: 'Unknown',
+										process: ProcessName.sync,
+										remoteModel: null!,
+										cause: err,
+									});
+								} catch (e) {
+									logger.error('Sync error handler failed with:', e);
+								}
 								this.initReject();
 							},
 						});

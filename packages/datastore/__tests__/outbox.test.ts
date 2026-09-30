@@ -315,8 +315,10 @@ describe('Outbox tests', () => {
 		});
 	});
 
-	// https://github.com/aws-amplify/amplify-js/issues/7888
-	it('Should retain the fields from the create mutation in the queue when it gets merged with an enqueued update mutation', async () => {
+	// https://github.com/aws-amplify/amplify-js/issues/7888 changed: the head of
+	// the queue is never merged into (a sender may be sending it), so the update
+	// is queued as its own event behind the create.
+	it('Should queue an update behind an enqueued create mutation instead of merging into the head', async () => {
 		const field1 = 'Some value';
 		const currentTimestamp = new Date().toISOString();
 		const optionalField1 = 'Optional value';
@@ -343,9 +345,81 @@ describe('Outbox tests', () => {
 			const head = await outbox.peek(s);
 			const headData = JSON.parse(head.data);
 
+			expect(head.operation).toEqual(TransformerMutationType.CREATE);
 			expect(headData.field1).toEqual(field1);
 			expect(headData.dateCreated).toEqual(currentTimestamp);
-			expect(headData.optionalField1).toEqual(optionalField1);
+			expect(headData.optionalField1).toBeFalsy();
+
+			const queued = await outbox.getForModel(
+				s,
+				updatedModel,
+				getModelDefinition(Model),
+			);
+			expect(queued.length).toEqual(2);
+			const [, update] = queued;
+			expect(update.operation).toEqual(TransformerMutationType.UPDATE);
+			expect(JSON.parse(update.data).optionalField1).toEqual(optionalField1);
+		});
+
+		// a second update merges into the queued update, not into the head
+		const updatedAgain = Model.copyOf(updatedModel, updated => {
+			updated.field1 = 'changed again';
+		});
+		await outbox.enqueue(Storage, await createMutationEvent(updatedAgain));
+
+		await Storage.runExclusive(async s => {
+			const queued = await outbox.getForModel(
+				s,
+				updatedModel,
+				getModelDefinition(Model),
+			);
+			expect(queued.length).toEqual(2);
+			const [head, update] = queued;
+			expect(head.operation).toEqual(TransformerMutationType.CREATE);
+			expect(JSON.parse(head.data).field1).toEqual(field1);
+			const updateData = JSON.parse(update.data);
+			expect(updateData.field1).toEqual('changed again');
+			expect(updateData.optionalField1).toEqual(optionalField1);
+		});
+	});
+
+	it('dequeue with an expected id removes nothing when the head is a different event', async () => {
+		await Storage.runExclusive(async s => {
+			let head = await outbox.peek(s);
+			while (head) {
+				await outbox.dequeue(s);
+				head = await outbox.peek(s);
+			}
+		});
+
+		const first = await createMutationEvent(
+			new Model({ field1: 'first', dateCreated: new Date().toISOString() }),
+		);
+		const second = await createMutationEvent(
+			new Model({ field1: 'second', dateCreated: new Date().toISOString() }),
+		);
+		await outbox.enqueue(Storage, first);
+		await outbox.enqueue(Storage, second);
+
+		await Storage.runExclusive(async s => {
+			// another tab removed `first` already: this tab must not remove `second`
+			const staleId = first.id;
+			await outbox.dequeue(s);
+			const head = await outbox.peek(s);
+			expect(head.id).toEqual(second.id);
+
+			const removed = await outbox.dequeue(s, undefined, undefined, staleId);
+			expect(removed).toBeUndefined();
+			expect((await outbox.peek(s)).id).toEqual(second.id);
+
+			const removedNow = await outbox.dequeue(
+				s,
+				undefined,
+				undefined,
+				second.id,
+			);
+			expect(removedNow?.id).toEqual(second.id);
+			expect(await outbox.peek(s)).toBeFalsy();
 		});
 	});
 });

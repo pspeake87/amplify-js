@@ -41,6 +41,12 @@ import {
 	extractPrimaryKeyFieldNames,
 } from '../util';
 
+import {
+	TOKEN_REQUEST_TIMEOUT_MS,
+	TransientRequestError,
+	withTimeLimit,
+} from './requestTimeout';
+
 import { MutationEvent } from './';
 
 const logger = new ConsoleLogger('DataStore');
@@ -932,15 +938,29 @@ export async function getTokenForCustomAuth(
 			authProviders: { functionAuthProvider } = { functionAuthProvider: null },
 		} = amplifyConfig;
 		if (functionAuthProvider && typeof functionAuthProvider === 'function') {
+			let token: string;
 			try {
-				const { token } = await functionAuthProvider();
-
-				return token;
+				// A token read that never settles (half-open connection after a
+				// wake-up) must not block the caller for ever.
+				({ token } = await withTimeLimit<{ token: string }>(
+					functionAuthProvider(),
+					TOKEN_REQUEST_TIMEOUT_MS,
+				));
 			} catch (error) {
-				throw new Error(
+				// The token is not an answer about any record: the caller must
+				// try again later.
+				throw new TransientRequestError(
 					`Error retrieving token from \`functionAuthProvider\`: ${error}`,
 				);
 			}
+
+			if (!token) {
+				// api-graphql would throw `NoAuthorizationHeader`; fail early
+				// with the same meaning
+				throw new TransientRequestError('No auth token specified');
+			}
+
+			return token;
 		} else {
 			// TODO: add docs link once available
 			throw new Error(

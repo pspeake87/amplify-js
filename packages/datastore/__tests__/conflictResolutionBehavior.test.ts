@@ -159,18 +159,20 @@ describe('DataStore sync engine', () => {
 					await postHarness.revise('post title 2');
 
 					await harness.fullSettle();
-					await harness.expectGraphqlSettledWithEventCount(0);
+					// the update is queued behind the in-flight create (the head is
+					// never merged into) and sent after it
+					await harness.expectGraphqlSettledWithEventCount(1);
 
 					expect(harness.subscriptionLogs()).toEqual([
 						['post title 0', undefined],
 						['post title 1', undefined],
 						['post title 2', undefined],
-						['post title 2', 1],
-						['post title 2', 1],
+						['post title 2', 2],
+						['post title 2', 2],
 					]);
 
 					expect(await postHarness.currentContents).toMatchObject({
-						_version: 1,
+						_version: 2,
 						title: 'post title 2',
 					});
 				});
@@ -193,17 +195,19 @@ describe('DataStore sync engine', () => {
 					await postHarness.revise('post title 2');
 
 					await harness.fullSettle();
-					await harness.expectGraphqlSettledWithEventCount(0);
+					// the update is queued behind the in-flight create (the head is
+					// never merged into) and sent after it
+					await harness.expectGraphqlSettledWithEventCount(1);
 
 					expect(harness.subscriptionLogs()).toEqual([
 						['post title 0', undefined],
 						['post title 1', undefined],
 						['post title 2', undefined],
-						['post title 2', 1],
+						['post title 2', 2],
 					]);
 
 					expect(await postHarness.currentContents).toMatchObject({
-						_version: 1,
+						_version: 2,
 						title: 'post title 2',
 					});
 				});
@@ -803,18 +807,20 @@ describe('DataStore sync engine', () => {
 					await postHarness.revise('post title 2');
 
 					await harness.fullSettle();
-					await harness.expectGraphqlSettledWithEventCount(0);
+					// the update is queued behind the in-flight create (the head is
+					// never merged into) and sent after it
+					await harness.expectGraphqlSettledWithEventCount(1);
 
 					expect(harness.subscriptionLogs()).toEqual([
 						['post title 0', undefined],
 						['post title 1', undefined],
 						['post title 2', undefined],
-						['post title 2', 1],
-						['post title 2', 1],
+						['post title 2', 2],
+						['post title 2', 2],
 					]);
 
 					expect(await postHarness.currentContents).toMatchObject({
-						_version: 1,
+						_version: 2,
 						title: 'post title 2',
 					});
 				});
@@ -837,17 +843,19 @@ describe('DataStore sync engine', () => {
 					await postHarness.revise('post title 2');
 
 					await harness.fullSettle();
-					await harness.expectGraphqlSettledWithEventCount(0);
+					// the update is queued behind the in-flight create (the head is
+					// never merged into) and sent after it
+					await harness.expectGraphqlSettledWithEventCount(1);
 
 					expect(harness.subscriptionLogs()).toEqual([
 						['post title 0', undefined],
 						['post title 1', undefined],
 						['post title 2', undefined],
-						['post title 2', 1],
+						['post title 2', 2],
 					]);
 
 					expect(await postHarness.currentContents).toMatchObject({
-						_version: 1,
+						_version: 2,
 						title: 'post title 2',
 					});
 				});

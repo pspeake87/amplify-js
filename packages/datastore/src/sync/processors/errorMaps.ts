@@ -58,14 +58,8 @@ export const syncErrorMap: ErrorMap = {
  * @param observableError an error from ZenObservable subscribe error callback
  */
 function unwrapObservableError(observableError: any) {
-	const {
-		errors: [error],
-	} = ({
-		// eslint-disable-next-line no-empty-pattern
-		errors: [],
-	} = observableError);
-
-	return error;
+	// a failure that is not in the GraphQL shape maps to its own message
+	return observableError?.errors?.[0] ?? observableError ?? { message: '' };
 }
 
 export function getMutationErrorType(error: Error): ErrorType {

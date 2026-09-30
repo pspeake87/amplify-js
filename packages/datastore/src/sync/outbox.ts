@@ -23,8 +23,6 @@ import { MutationEvent } from './index';
 // TODO: Persist deleted ids
 // https://github.com/aws-amplify/amplify-js/blob/datastore-docs/packages/datastore/docs/sync-engine.md#outbox
 class MutationEventOutbox {
-	private inProgressMutationEventId!: string;
-
 	constructor(
 		private readonly schema: InternalSchema,
 		private readonly _MutationEvent: PersistentModelConstructor<MutationEvent>,
@@ -32,25 +30,22 @@ class MutationEventOutbox {
 		private readonly ownSymbol: symbol,
 	) {}
 
+	/**
+	 * The head of the queue is never merged into. A sender (in this tab or in
+	 * another tab on the same origin) may be sending it, and a merge would
+	 * change the event under that request. A later change to the same record
+	 * is queued as its own event behind the head.
+	 */
 	public async enqueue(
 		storage: Storage,
 		mutationEvent: MutationEvent,
 	): Promise<void> {
 		await storage.runExclusive(async s => {
-			const mutationEventModelDefinition =
-				this.schema.namespaces[SYNC].models.MutationEvent;
+			const head = await s.queryOne(this._MutationEvent, QueryOne.FIRST);
 
 			// `id` is the key for the record in the mutationEvent;
 			// `modelId` is the key for the actual record that was mutated
-			const predicate = ModelPredicateCreator.createFromAST<MutationEvent>(
-				mutationEventModelDefinition,
-				{
-					and: [
-						{ modelId: { eq: mutationEvent.modelId } },
-						{ id: { ne: this.inProgressMutationEventId } },
-					],
-				},
-			);
+			const predicate = this.othersForModel(mutationEvent.modelId, head?.id);
 
 			// Check if there are any other records with same id
 			const [first] = await s.query(this._MutationEvent, predicate);
@@ -103,36 +98,57 @@ class MutationEventOutbox {
 		});
 	}
 
+	/**
+	 * Removes the head of the queue after the server answered for it.
+	 *
+	 * The head is read one time. When `expectedId` is given and the head is a
+	 * different event (another tab on the same outbox removed the sent event
+	 * already), nothing is removed and `undefined` is returned: the event now
+	 * at the head was never sent.
+	 */
 	public async dequeue(
 		storage: StorageClass,
 		record?: PersistentModel,
 		recordOp?: TransformerMutationType,
-	): Promise<MutationEvent> {
+		expectedId?: string,
+	): Promise<MutationEvent | undefined> {
 		const head = await this.peek(storage);
+
+		if (!head || (expectedId !== undefined && head.id !== expectedId)) {
+			return undefined;
+		}
 
 		if (record) {
 			await this.syncOutboxVersionsOnDequeue(storage, record, head, recordOp!);
 		}
 
-		if (head) {
-			await storage.delete(head);
-		}
-		this.inProgressMutationEventId = undefined!;
+		await storage.delete(head);
 
 		return head;
 	}
 
-	/**
-	 * Doing a peek() implies that the mutation goes "inProgress"
-	 *
-	 * @param storage
-	 */
 	public async peek(storage: StorageFacade): Promise<MutationEvent> {
 		const head = await storage.queryOne(this._MutationEvent, QueryOne.FIRST);
 
-		this.inProgressMutationEventId = head ? head.id : undefined!;
-
 		return head!;
+	}
+
+	/**
+	 * Every queued event for a record, except `exceptId`.
+	 */
+	private othersForModel(modelId: string, exceptId?: string) {
+		const mutationEventModelDefinition =
+			this.schema.namespaces[SYNC].models.MutationEvent;
+
+		return ModelPredicateCreator.createFromAST<MutationEvent>(
+			mutationEventModelDefinition,
+			{
+				and: [
+					{ modelId: { eq: modelId } },
+					...(exceptId !== undefined ? [{ id: { ne: exceptId } }] : []),
+				],
+			},
+		);
 	}
 
 	public async getForModel<T extends PersistentModel>(
@@ -207,22 +223,11 @@ class MutationEventOutbox {
 			return;
 		}
 
-		const mutationEventModelDefinition =
-			this.schema.namespaces[SYNC].models.MutationEvent;
-
 		const userModelDefinition = this.schema.namespaces.user.models[head.model];
 
 		const recordId = getIdentifierValue(userModelDefinition, record);
 
-		const predicate = ModelPredicateCreator.createFromAST<MutationEvent>(
-			mutationEventModelDefinition,
-			{
-				and: [
-					{ modelId: { eq: recordId } },
-					{ id: { ne: this.inProgressMutationEventId } },
-				],
-			},
-		);
+		const predicate = this.othersForModel(recordId, head.id);
 
 		const outdatedMutations = await storage.query(
 			this._MutationEvent,

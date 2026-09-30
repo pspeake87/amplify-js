@@ -464,12 +464,13 @@ class SubscriptionProcessor {
 													this.drainBuffer();
 												},
 												error: async subscriptionError => {
-													const {
-														errors: [{ message = '' } = {}],
-													} = ({
-														// eslint-disable-next-line no-empty-pattern
-														errors: [],
-													} = subscriptionError);
+													// A failure is not always in the GraphQL shape (a plain
+													// Error from the transport, for example). It must still
+													// be reported, so never throw while reading it.
+													const message: string =
+														subscriptionError?.errors?.[0]?.message ??
+														subscriptionError?.message ??
+														String(subscriptionError);
 
 													const isRTFError =
 														// only attempt catch if a filter variable was added to the subscription query

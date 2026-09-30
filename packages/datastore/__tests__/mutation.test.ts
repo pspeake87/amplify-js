@@ -1,5 +1,14 @@
+// The processor keeps a write whose request failed at the transport level and
+// (with the real `retry`) tries again without end. The mock makes one attempt,
+// then pauses the processor the way a stop does, so the loop exits.
+let processorUnderTest: any;
 const mockRetry = jest.fn(async (fn, args) => {
-	await fn(...args);
+	try {
+		return await fn(...args);
+	} catch (error) {
+		processorUnderTest?.pause();
+		throw error;
+	}
 });
 const mockRestPost = jest.fn(() => Promise.reject(serverError));
 
@@ -12,8 +21,9 @@ import {
 	getAmplifyUserAgent,
 } from '@aws-amplify/core/internals/utils';
 import {
+	MAX_RETRY_DELAY_MS,
 	MutationProcessor,
-	safeJitteredBackoff,
+	mutationRetryDelay,
 } from '../src/sync/processors/mutation';
 import {
 	Model as ModelType,
@@ -29,6 +39,7 @@ import {
 } from '../src/types';
 import { createMutationInstanceFromModelOperation } from '../src/sync/utils';
 import { SyncEngine, MutationEvent } from '../src/sync/';
+import { TransientRequestError } from '../src/sync/requestTimeout';
 
 jest.mock('@aws-amplify/api/internals', () => {
 	const apiInternals = jest.requireActual('@aws-amplify/api/internals');
@@ -61,50 +72,22 @@ const datastoreUserAgentDetails: CustomUserAgentDetails = {
 	action: DataStoreAction.GraphQl,
 };
 
-describe('Jittered backoff', () => {
-	it('should progress exponentially until some limit', () => {
-		const COUNT = 13;
-
-		const backoffs = [...Array(COUNT)].map((v, i) =>
-			safeJitteredBackoff(i),
-		) as (number | boolean)[];
-
-		const isExpectedValue = (value, attempt) => {
-			const lowerLimit = 2 ** attempt * 100;
-			const upperLimit = lowerLimit + 100;
-
-			if (lowerLimit < 2 ** 12 * 100) {
-				console.log(
-					`attempt ${attempt} (${value}) should be between ${lowerLimit} and ${upperLimit} inclusively.`,
-				);
-				return value >= lowerLimit && value <= upperLimit;
-			} else {
-				console.log(`attempt ${attempt} (${value}) should be false.`);
-				return value === false;
-			}
-		};
-
-		backoffs.forEach((value, attempt) => {
-			expect(isExpectedValue(value, attempt)).toBe(true);
-		});
-
-		// we should be testing up to the edge. at least one backoff at the
-		// end of the list must be false. (past the limit)
-		expect(backoffs.pop()).toBe(false);
-	});
-
-	it('should retry forever on network errors', () => {
-		const MAX_DELAY = 5 * 60 * 1000;
+describe('mutationRetryDelay', () => {
+	it('grows exponentially, then stays at MAX_RETRY_DELAY_MS for ever', () => {
 		const COUNT = 1000;
 
-		const backoffs = [...Array(COUNT)].map((v, i) =>
-			safeJitteredBackoff(i, [], new Error('Network Error')),
-		) as (number | boolean)[];
+		const delays = [...Array(COUNT)].map((v, i) => mutationRetryDelay(i));
 
-		backoffs.forEach(v => {
-			expect(v).toBeTruthy();
-			expect(v).toBeLessThanOrEqual(MAX_DELAY);
+		delays.forEach((value, attempt) => {
+			const lowerLimit = Math.min(2 ** attempt * 100, MAX_RETRY_DELAY_MS);
+			const upperLimit = Math.min(lowerLimit + 100, MAX_RETRY_DELAY_MS);
+
+			expect(value).toBeGreaterThanOrEqual(lowerLimit);
+			expect(value).toBeLessThanOrEqual(upperLimit);
 		});
+
+		expect(delays[COUNT - 1]).toEqual(MAX_RETRY_DELAY_MS);
+		expect(MAX_RETRY_DELAY_MS).toEqual(30000);
 	});
 });
 
@@ -138,7 +121,7 @@ describe('MutationProcessor', () => {
 			expect(mockRetry.mock.results).toHaveLength(1);
 
 			await expect(mockRetry.mock.results[0].value).rejects.toEqual(
-				new Error('Network Error'),
+				new TransientRequestError(),
 			);
 
 			expect(mutationProcessorSpy).toHaveBeenCalled();
@@ -147,6 +130,9 @@ describe('MutationProcessor', () => {
 			await expect(mutationProcessorSpy.mock.results[0].value).resolves.toEqual(
 				undefined,
 			);
+
+			// the write is still in the outbox
+			expect((mutationProcessor as any).outbox.peek()).toBeDefined();
 		});
 	});
 	describe('createQueryVariables', () => {
@@ -279,7 +265,7 @@ describe('error handler', () => {
 		);
 	});
 
-	test('server error', async () => {
+	test('server error keeps the write in the outbox', async () => {
 		serverError = {
 			originalError: {
 				$metadata: {
@@ -288,13 +274,29 @@ describe('error handler', () => {
 			},
 		};
 		await mutationProcessor.resume();
-		expect(errorHandler).toHaveBeenCalledWith(
-			expect.objectContaining({
-				operation: 'Create',
-				process: 'mutate',
-				errorType: 'Transient',
-			}),
-		);
+		expect(errorHandler).not.toHaveBeenCalled();
+		expect((mutationProcessor as any).outbox.peek()).toBeDefined();
+	});
+
+	test("v6 network error ('A network error has occurred.') keeps the write in the outbox", async () => {
+		serverError = {
+			name: 'NetworkError',
+			message: 'A network error has occurred.',
+		};
+		await mutationProcessor.resume();
+		expect(errorHandler).not.toHaveBeenCalled();
+		expect((mutationProcessor as any).outbox.peek()).toBeDefined();
+	});
+
+	test('definitive server answer removes the write from the outbox', async () => {
+		serverError = {
+			message: "Variable 'name' has coerced Null value for NonNull type",
+			name: 'Error',
+			code: '',
+			errorType: '',
+		};
+		await mutationProcessor.resume();
+		expect((mutationProcessor as any).outbox.peek()).toBeUndefined();
 	});
 
 	test('no auth decorator', async () => {
@@ -314,6 +316,9 @@ describe('error handler', () => {
 				errorType: 'Unauthorized',
 			}),
 		);
+		expect(errorHandler).toHaveBeenCalledTimes(1);
+		// HTTP 401 is a rejected token, not an answer for the record
+		expect((mutationProcessor as any).outbox.peek()).toBeDefined();
 	});
 });
 
@@ -391,6 +396,7 @@ async function instantiateMutationProcessor({
 	);
 
 	(mutationProcessor as any).observer = true;
+	processorUnderTest = mutationProcessor;
 
 	return mutationProcessor;
 }

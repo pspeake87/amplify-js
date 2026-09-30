@@ -28,6 +28,7 @@ import {
 	OpType,
 	OptionallyManagedIdentifier,
 	PersistentModelConstructor,
+	ProcessName,
 	SchemaModel,
 	SchemaNamespace,
 	TypeConstructorMap,
@@ -49,6 +50,12 @@ import {
 } from './utils';
 
 const logger = new ConsoleLogger('DataStore');
+
+/**
+ * Longest time the mutation processor waits for the sync queries after the
+ * engine comes online.
+ */
+export const SENDER_START_MAX_WAIT_MS = 10000;
 
 const ownSymbol = Symbol('sync');
 
@@ -129,6 +136,21 @@ export class SyncEngine {
 	private stopDisruptionListener: () => void;
 	private connectionDisrupted = false;
 
+	/**
+	 * True from the start of `stop()` until the engine is ready to restart.
+	 * Nothing new (the mutation processor in particular) starts meanwhile.
+	 */
+	private stopping = false;
+
+	/**
+	 * `_version` of every record merged from a mutation response or a realtime
+	 * message since the current sync round started, keyed by model and id.
+	 * A sync page the server read before such a merge carries an older
+	 * version of the record; those items are dropped so that the page does
+	 * not revert the newer local record.
+	 */
+	private readonly mergedVersions = new Map<string, number>();
+
 	private runningProcesses: BackgroundProcessManager;
 
 	public getModelSyncedStatus(
@@ -145,7 +167,7 @@ export class SyncEngine {
 		private readonly storage: Storage,
 		private readonly modelInstanceCreator: ModelInstanceCreator,
 		conflictHandler: ConflictHandler,
-		errorHandler: ErrorHandler,
+		private readonly errorHandler: ErrorHandler,
 		private readonly syncPredicates: WeakMap<
 			SchemaModel,
 			ModelPredicate<any> | null
@@ -214,7 +236,7 @@ export class SyncEngine {
 
 			let subscriptions: SubscriptionLike[] = [];
 
-			this.runningProcesses.add(async () => {
+			this.runningProcesses.add(async onStartTerminate => {
 				try {
 					await this.setupModels(params);
 				} catch (err) {
@@ -223,10 +245,28 @@ export class SyncEngine {
 					return;
 				}
 
+				let terminated = false;
+				onStartTerminate.then(() => {
+					terminated = true;
+				});
+
+				// Resolves when the mutation processor is running (or the engine
+				// is offline): a save may then wake the processor.
+				let signalSenderReady!: () => void;
+				const senderReady = new Promise<void>(resolve => {
+					signalSenderReady = resolve;
+				});
+
 				// this is awaited at the bottom. so, we don't need to register
 				// this explicitly with the context. it's already contained.
+				// Resolves when the first sync round is done (or the engine is
+				// offline): `SYNC_ENGINE_READY` then tells the app that the local
+				// store holds the server data.
 				const startPromise = new Promise<void>((resolve, reject) => {
-					const doneStarting = resolve;
+					const doneStarting = () => {
+						signalSenderReady();
+						resolve();
+					};
 					const failedStarting = reject;
 
 					this.datastoreConnectivity.status().subscribe(
@@ -283,8 +323,39 @@ export class SyncEngine {
 									// #endregion
 
 									// #region Base & Sync queries
+									let syncTerminated = false;
 									try {
+										// The outbox must not depend on the sync queries: a sync
+										// that is slow (or never completes) would otherwise keep
+										// every queued mutation from being sent. Start the
+										// mutation processor when the sync queries are ready or
+										// after SENDER_START_MAX_WAIT_MS, whichever is first. The
+										// sync continues in both cases.
 										await new Promise<void>((_resolve, _reject) => {
+											let raceDone = false;
+											// eslint-disable-next-line prefer-const
+											let senderStartTimer: ReturnType<typeof setTimeout>;
+											const endRace = (error?: unknown) => {
+												if (raceDone) {
+													return false;
+												}
+												raceDone = true;
+												clearTimeout(senderStartTimer);
+												error === undefined ? _resolve() : _reject(error);
+
+												return true;
+											};
+											senderStartTimer = setTimeout(() => {
+												logger.warn(
+													'Sync queries not ready; starting the mutation processor',
+												);
+												endRace();
+											}, SENDER_START_MAX_WAIT_MS);
+											onTerminate.then(() => {
+												syncTerminated = true;
+												endRace();
+											});
+
 											const syncQuerySubscription =
 												this.syncQueriesObservable().subscribe({
 													next: message => {
@@ -294,16 +365,21 @@ export class SyncEngine {
 															type ===
 															ControlMessage.SYNC_ENGINE_SYNC_QUERIES_READY
 														) {
-															_resolve();
+															endRace();
+															doneStarting();
 														}
 
 														observer.next(message);
 													},
 													complete: () => {
-														_resolve();
+														endRace();
+														doneStarting();
 													},
 													error: error => {
-														_reject(error);
+														if (!endRace(error)) {
+															// the mutation processor already started
+															observer.error(error);
+														}
 													},
 												});
 
@@ -314,6 +390,13 @@ export class SyncEngine {
 									} catch (error) {
 										observer.error(error);
 										failedStarting();
+
+										return;
+									}
+
+									if (syncTerminated || this.stopping) {
+										// the engine is stopping: do not start the mutation processor
+										doneStarting();
 
 										return;
 									}
@@ -334,12 +417,19 @@ export class SyncEngine {
 														item,
 													);
 
-													await this.storage.runExclusive(storage =>
-														this.modelMerger.merge(
-															storage,
-															model,
-															modelDefinition,
-														),
+													await this.reportJobFailure(
+														'merge of a mutation response',
+														modelDefinition.name,
+														item,
+														() =>
+															this.storage.runExclusive(async storage => {
+																await this.modelMerger.merge(
+																	storage,
+																	model,
+																	modelDefinition,
+																);
+																this.noteMergedVersion(modelDefinition, item);
+															}),
 													);
 
 													observer.next({
@@ -375,17 +465,26 @@ export class SyncEngine {
 														item,
 													);
 
-													await this.storage.runExclusive(storage =>
-														this.modelMerger.merge(
-															storage,
-															model,
-															modelDefinition,
-														),
+													await this.reportJobFailure(
+														'merge of a realtime message',
+														modelDefinition.name,
+														item,
+														() =>
+															this.storage.runExclusive(async storage => {
+																await this.modelMerger.merge(
+																	storage,
+																	model,
+																	modelDefinition,
+																);
+																this.noteMergedVersion(modelDefinition, item);
+															}),
 													);
 												}, 'subscription dataSubsObservable event'),
 										),
 									);
 									// #endregion
+
+									signalSenderReady();
 								} else if (!online) {
 									this.online = online;
 
@@ -400,9 +499,9 @@ export class SyncEngine {
 										sub.unsubscribe();
 									});
 									subscriptions = [];
-								}
 
-								doneStarting();
+									doneStarting();
+								}
 							}, 'datastore connectivity event'),
 					);
 				});
@@ -439,7 +538,22 @@ export class SyncEngine {
 									this.modelInstanceCreator,
 								);
 
-								await this.outbox.enqueue(this.storage, mutationEvent);
+								// A save that does not reach the outbox is a lost change:
+								// the record is in the local store, but it is never sent.
+								const queued = await this.reportJobFailure(
+									'enqueue of a local change',
+									modelDefinition.name,
+									element,
+									async () => {
+										await this.outbox.enqueue(this.storage, mutationEvent);
+
+										return true;
+									},
+								);
+
+								if (!queued) {
+									return;
+								}
 
 								observer.next({
 									type: ControlMessage.SYNC_ENGINE_OUTBOX_MUTATION_ENQUEUED,
@@ -456,7 +570,7 @@ export class SyncEngine {
 									},
 								});
 
-								await startPromise;
+								await senderReady;
 
 								// Set by the this.datastoreConnectivity.status().subscribe() loop
 								if (this.online) {
@@ -478,7 +592,12 @@ export class SyncEngine {
 					},
 				});
 
-				await startPromise;
+				// a stop before the first sync round is done must not hang here
+				await Promise.race([startPromise, onStartTerminate]);
+
+				if (terminated) {
+					return;
+				}
 
 				observer.next({
 					type: ControlMessage.SYNC_ENGINE_READY,
@@ -530,6 +649,9 @@ export class SyncEngine {
 					let terminated = false;
 
 					while (!observer.closed && !terminated) {
+						// merges before this point are in the server data this round reads
+						this.mergedVersions.clear();
+
 						const count = new WeakMap<
 							PersistentModelConstructor<any>,
 							{
@@ -593,7 +715,10 @@ export class SyncEngine {
 												await this.outbox.getModelIds(storage);
 
 											const oneByOne: ModelInstanceMetadata[] = [];
-											const page = items.filter(item => {
+											const page = this.dropStaleItems(
+												modelDefinition,
+												items,
+											).filter(item => {
 												const itemId = getIdentifierValue(
 													modelDefinition,
 													item,
@@ -790,6 +915,84 @@ export class SyncEngine {
 		});
 	}
 
+	/**
+	 * Runs one background job. `BackgroundProcessManager` swallows a job's
+	 * rejection, so a failure (a broken IndexedDB, for example) would be
+	 * silent. It is reported through the error handler instead; the job
+	 * then ends (nothing waits for its result).
+	 */
+	private async reportJobFailure<T>(
+		what: string,
+		modelName: string,
+		record: Readonly<Record<string, any>> | undefined,
+		job: () => Promise<T>,
+	): Promise<T | undefined> {
+		try {
+			return await job();
+		} catch (error) {
+			logger.error(`Sync engine: ${what} failed`, error);
+			try {
+				// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression
+				await this.errorHandler({
+					recoverySuggestion:
+						'The local database refused a write. Reload the page; if it persists, the browser storage is broken.',
+					localModel: (record ?? null) as any,
+					message: `${what} failed: ${(error as any)?.message ?? error}`,
+					model: modelName,
+					operation: what,
+					errorType: 'Unknown',
+					process: ProcessName.sync,
+					remoteModel: null!,
+					cause: error as Error,
+				});
+			} catch (e) {
+				logger.error('Sync engine error handler failed with:', e);
+			}
+
+			return undefined;
+		}
+	}
+
+	private mergedVersionKey(
+		modelDefinition: SchemaModel,
+		item: ModelInstanceMetadata,
+	): string {
+		return `${modelDefinition.name}|${getIdentifierValue(modelDefinition, item)}`;
+	}
+
+	private noteMergedVersion(
+		modelDefinition: SchemaModel,
+		item: Readonly<Record<string, any>>,
+	) {
+		if (typeof item?._version === 'number') {
+			this.mergedVersions.set(
+				this.mergedVersionKey(modelDefinition, item as ModelInstanceMetadata),
+				item._version,
+			);
+		}
+	}
+
+	/**
+	 * Drops the items of a sync page that are older than a record merged from
+	 * a mutation response or a realtime message during this round.
+	 */
+	private dropStaleItems(
+		modelDefinition: SchemaModel,
+		items: ModelInstanceMetadata[],
+	): ModelInstanceMetadata[] {
+		if (this.mergedVersions.size === 0) {
+			return items;
+		}
+
+		return items.filter(item => {
+			const merged = this.mergedVersions.get(
+				this.mergedVersionKey(modelDefinition, item),
+			);
+
+			return merged === undefined || !(item._version <= merged);
+		});
+	}
+
 	private disconnectionHandler(): (msg: string) => void {
 		return (msg: string) => {
 			// This implementation is tied to AWSAppSyncRealTimeProvider 'Connection closed', 'Timeout disconnect' msg
@@ -812,6 +1015,7 @@ export class SyncEngine {
 	 */
 	public async stop() {
 		logger.debug('stopping sync engine');
+		this.stopping = true;
 
 		/**
 		 * Gracefully disconnecting subscribers first just prevents *more* work
@@ -837,6 +1041,7 @@ export class SyncEngine {
 		await this.syncQueriesProcessor.stop();
 		await this.runningProcesses.close();
 		await this.runningProcesses.open();
+		this.stopping = false;
 
 		logger.debug('sync engine stopped and ready to restart');
 	}

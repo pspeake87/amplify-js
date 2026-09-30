@@ -649,7 +649,10 @@ export class FakeGraphQLService {
 
 			if (operation === 'query') {
 				if (type === 'get') {
-					const record = table.get(this.getPK(tableName, variables.input));
+					// a real GET carries the key fields as variables, not `input`
+					const record = table.get(
+						this.getPK(tableName, variables.input ?? variables),
+					);
 					data = { [selection]: record };
 				} else if (type === 'list' || type === 'sync') {
 					data = {
