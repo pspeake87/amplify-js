@@ -226,12 +226,20 @@ export abstract class AWSWebSocketProvider {
 		return this._publishMessage(options, customUserAgentDetails);
 	}
 
-	private async _connectWebSocket(options: AWSAppSyncRealTimeProviderOptions) {
+	/**
+	 * @param resolvedHeaders headers the caller resolved already (the token
+	 * provider is then called one time per subscription start, not two)
+	 */
+	private async _connectWebSocket(
+		options: AWSAppSyncRealTimeProviderOptions,
+		resolvedHeaders?: Record<string, string>,
+	) {
 		const { apiKey, appSyncGraphqlEndpoint, authenticationType, region } =
 			options;
 
-		const { additionalCustomHeaders } =
-			await additionalHeadersFromOptions(options);
+		const additionalCustomHeaders =
+			resolvedHeaders ??
+			(await additionalHeadersFromOptions(options)).additionalCustomHeaders;
 
 		this.connectionStateMonitor.record(CONNECTION_CHANGE.OPENING_CONNECTION);
 		await this._initializeWebSocketConnection({
@@ -445,6 +453,14 @@ export abstract class AWSWebSocketProvider {
 	}) {
 		const { query, variables } = options;
 
+		// A replay reuses the subscription id. A start_ack timer of the previous
+		// attempt must not fire against this attempt's connection.
+		const previousStartAckTimeoutId =
+			this.subscriptionObserverMap.get(subscriptionId)?.startAckTimeoutId;
+		if (previousStartAckTimeoutId) {
+			clearTimeout(previousStartAckTimeoutId);
+		}
+
 		this.subscriptionObserverMap.set(subscriptionId, {
 			observer,
 			query: query ?? '',
@@ -466,7 +482,7 @@ export abstract class AWSWebSocketProvider {
 			});
 
 		try {
-			await this._connectWebSocket(options);
+			await this._connectWebSocket(options, additionalCustomHeaders);
 		} catch (err: any) {
 			this._logStartSubscriptionError(subscriptionId, observer, err);
 
@@ -820,6 +836,18 @@ export abstract class AWSWebSocketProvider {
 
 	private _errorDisconnect(msg: string) {
 		this.logger.debug(`Disconnect error: ${msg}`);
+
+		if (this.socketStatus === SOCKET_STATUS.CONNECTING) {
+			// A connection attempt is in progress. This error belongs to the
+			// previous socket (its onclose, a stale timer). Marking the status
+			// CLOSED now would let the next subscription open a second socket
+			// in parallel and leak the one that is connecting.
+			this.logger.debug(
+				'Disconnect error ignored: a connection is in progress',
+			);
+
+			return;
+		}
 
 		if (this.awsRealTimeSocket) {
 			this._closeSocket();

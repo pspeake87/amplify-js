@@ -1401,7 +1401,8 @@ describe('AWSAppSyncRealTimeProvider', () => {
 					});
 
 					test('authenticating with AWS_LAMBDA/custom w/ custom header function that accepts request options', async () => {
-						expect.assertions(3);
+						// the header function (token provider) is called one time per start
+						expect.assertions(2);
 
 						provider
 							.subscribe({
