@@ -421,6 +421,216 @@ describe('Sync', () => {
 			);
 		});
 	});
+
+	/**
+	 * A connection-level realtime failure is one failure, not one per model and
+	 * operation. The provider decides when an episode is worth reporting; the
+	 * sync engine turns that one decision into one error handler call.
+	 */
+	describe('realtime failure reports', () => {
+		let Hub: any;
+		let AMPLIFY_SYMBOL: symbol;
+		let SyncEngine: any;
+		let apiGraphql: any;
+		let errorHandler: jest.Mock;
+		let scheduleSync: jest.Mock;
+		let engine: any;
+		let stopListener: () => void;
+
+		// The listener accepts reports from the AppSync realtime provider only,
+		// so every payload carries its name unless a test says otherwise.
+		const dispatch = (event: string, data: any, source = 'PubSub') => {
+			const payload =
+				data && typeof data === 'object' && !('providerName' in data)
+					? { providerName: 'AWSAppSyncRealTimeProvider', ...data }
+					: data;
+			Hub.dispatch('api', { event, data: payload }, source, AMPLIFY_SYMBOL);
+		};
+
+		/** Drains the microtask queue the async report runs on. */
+		const flush = async () => {
+			for (let i = 0; i < 10; i++) {
+				await Promise.resolve();
+			}
+		};
+
+		const authFailure = {
+			report: 'open',
+			reason: 'no-auth-token',
+			isAuthFailure: true,
+			message:
+				'Connection failed: UnauthorizedException: no auth token was available',
+			diagnostics: {
+				episodeId: 1,
+				consecutiveFailures: 2,
+				socketsAttempted: 0,
+				socketStatus: 'CLOSED',
+				subscriptions: 45,
+			},
+		};
+
+		beforeEach(() => {
+			jest.resetModules();
+
+			Hub = require('@aws-amplify/core').Hub;
+			AMPLIFY_SYMBOL =
+				require('@aws-amplify/core/internals/utils').AMPLIFY_SYMBOL;
+			apiGraphql = require('@aws-amplify/api-graphql');
+			SyncEngine = require('../src/sync').SyncEngine;
+
+			errorHandler = jest.fn();
+			scheduleSync = jest.fn();
+
+			// The listener and the report are instance methods of SyncEngine. A
+			// whole engine is not needed to prove what the listener does with one
+			// payload, so they run against the three fields they use.
+			engine = {
+				errorHandler,
+				scheduleSync,
+				connectionDisrupted: false,
+				reportRealtimeFailure: SyncEngine.prototype.reportRealtimeFailure,
+			};
+			stopListener = SyncEngine.prototype.startDisruptionListener.call(engine);
+		});
+
+		afterEach(() => {
+			stopListener?.();
+		});
+
+		test('a report from another provider is ignored', async () => {
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, {
+				...authFailure,
+				providerName: 'AWSAppSyncEventsProvider',
+			});
+			await flush();
+
+			expect(errorHandler).not.toHaveBeenCalled();
+		});
+
+		test('report open calls errorHandler once, errorType Unauthorized for an auth reason', async () => {
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, authFailure);
+			await flush();
+
+			expect(errorHandler).toHaveBeenCalledTimes(1);
+			expect(errorHandler).toHaveBeenCalledWith(
+				expect.objectContaining({
+					errorType: 'Unauthorized',
+					operation: 'Connect',
+					process: 'subscribe',
+					model: undefined,
+					message: authFailure.message,
+				}),
+			);
+
+			const call = errorHandler.mock.calls[0][0];
+			expect(JSON.parse(call.errorInfo)).toMatchObject({
+				reason: 'no-auth-token',
+				report: 'open',
+				socketsAttempted: 0,
+				subscriptions: 45,
+			});
+			// anything that classifies by message instead of errorType gets the
+			// same answer (subscriptionErrorMap.Unauthorized)
+			expect(/Connection failed.+Unauthorized/.test(call.message)).toBe(true);
+		});
+
+		test('errorType is Transient for any other reason', async () => {
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, {
+				report: 'open',
+				reason: 'connect-deadline',
+				isAuthFailure: false,
+				message: 'Connection failed: Realtime open did not finish in 15000 ms',
+				diagnostics: { socketsOpened: 1, socketStatus: 'CONNECTING' },
+			});
+			await flush();
+
+			expect(errorHandler).toHaveBeenCalledTimes(1);
+			expect(errorHandler).toHaveBeenCalledWith(
+				expect.objectContaining({
+					errorType: 'Transient',
+					operation: 'Connect',
+					process: 'subscribe',
+				}),
+			);
+			expect(
+				JSON.parse(errorHandler.mock.calls[0][0].errorInfo),
+			).toMatchObject({ reason: 'connect-deadline', socketsOpened: 1 });
+		});
+
+		test('a repeat report is still one call', async () => {
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, {
+				...authFailure,
+				report: 'repeat',
+			});
+			await flush();
+
+			expect(errorHandler).toHaveBeenCalledTimes(1);
+			expect(
+				JSON.parse(errorHandler.mock.calls[0][0].errorInfo).report,
+			).toEqual('repeat');
+		});
+
+		test('report none calls no handler', async () => {
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, {
+				...authFailure,
+				report: 'none',
+			});
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, {
+				...authFailure,
+				report: undefined,
+			});
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, undefined);
+			await flush();
+
+			expect(errorHandler).not.toHaveBeenCalled();
+		});
+
+		test('realtimeRecovered calls no handler, and the next Connected still schedules the catch-up sync', async () => {
+			dispatch(apiGraphql.REALTIME_RECOVERED, {});
+			await flush();
+
+			expect(errorHandler).not.toHaveBeenCalled();
+
+			dispatch(apiGraphql.CONNECTION_STATE_CHANGE, {
+				connectionState: apiGraphql.ConnectionState.ConnectionDisrupted,
+			});
+			expect(engine.connectionDisrupted).toBe(true);
+			expect(scheduleSync).not.toHaveBeenCalled();
+
+			dispatch(apiGraphql.CONNECTION_STATE_CHANGE, {
+				connectionState: apiGraphql.ConnectionState.Connected,
+			});
+			expect(scheduleSync).toHaveBeenCalledTimes(1);
+			expect(engine.connectionDisrupted).toBe(false);
+			expect(errorHandler).not.toHaveBeenCalled();
+		});
+
+		test('an api event from another source is ignored', async () => {
+			dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, authFailure, 'Other');
+			dispatch(
+				apiGraphql.CONNECTION_STATE_CHANGE,
+				{ connectionState: apiGraphql.ConnectionState.ConnectionDisrupted },
+				'Other',
+			);
+			await flush();
+
+			expect(errorHandler).not.toHaveBeenCalled();
+			expect(engine.connectionDisrupted).toBe(false);
+		});
+
+		test('a throwing errorHandler does not escape the listener', async () => {
+			errorHandler.mockImplementation(() => {
+				throw new Error('host handler is broken');
+			});
+
+			expect(() =>
+				dispatch(apiGraphql.REALTIME_CONNECTION_FAILURE, authFailure),
+			).not.toThrow();
+			await flush();
+
+			expect(errorHandler).toHaveBeenCalledTimes(1);
+		});
+	});
 });
 
 function jitteredRetrySyncProcessorSetup({

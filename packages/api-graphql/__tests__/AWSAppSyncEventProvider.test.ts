@@ -179,7 +179,7 @@ describe('AppSyncEventProvider', () => {
 					loggerSpy.mockClear();
 				});
 
-				test('subscription observer error is triggered when a connection is formed and a non-retriable connection_error data message is received', async () => {
+				test('a rejected credential closes the socket and does not error the subscription', async () => {
 					expect.assertions(3);
 
 					const socketCloseSpy = jest.spyOn(
@@ -192,13 +192,8 @@ describe('AppSyncEventProvider', () => {
 						appSyncGraphqlEndpoint: 'ws://localhost:8080',
 					});
 
-					observer.subscribe({
-						error: e => {
-							expect(e.errors[0].message).toEqual(
-								'Connection failed: UnauthorizedException',
-							);
-						},
-					});
+					const errorSpy = jest.fn();
+					observer.subscribe({ error: errorSpy });
 
 					await fakeWebSocketInterface?.readyForUse;
 					await fakeWebSocketInterface?.triggerOpen();
@@ -228,6 +223,12 @@ describe('AppSyncEventProvider', () => {
 					await delay(1);
 
 					expect(socketCloseSpy).toHaveBeenCalledWith(3001);
+
+					// A rejected CONNECTION is one failure, not one per subscription.
+					// The provider reports it once on the Hub and leaves every
+					// observable alone: erroring them made DataStore tear the model's
+					// subscriptions down and never rebuild them.
+					expect(errorSpy).not.toHaveBeenCalled();
 				});
 
 				test('subscription observer error is triggered when a subscribe_error message is received', async () => {

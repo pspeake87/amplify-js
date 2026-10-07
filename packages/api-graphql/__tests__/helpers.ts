@@ -140,9 +140,29 @@ export class FakeWebSocketInterface {
 	 */
 	async triggerOpen() {
 		await this.runAndResolve(() => {
-			// @ts-ignore
-			this.webSocket.onopen(new Event('', {}));
+			// A socket the provider discarded has no handlers at all, so it cannot
+			// speak. Mirror that here instead of throwing.
+			if (this.webSocket.onopen) {
+				// @ts-ignore
+				this.webSocket.onopen(new Event('', {}));
+			}
 		});
+	}
+
+	/**
+	 * Resolves once the provider has created a socket and armed its onopen. A
+	 * replay arms it one turn after the Connecting label is published, and a
+	 * discarded socket has no handlers, so an event triggered before this point
+	 * reaches nothing.
+	 */
+	async waitForNewSocket(timeoutMs = 1000) {
+		const start = Date.now();
+		while (typeof this.webSocket.onopen !== 'function') {
+			if (Date.now() - start > timeoutMs) {
+				throw new Error('no new socket was created');
+			}
+			await delay(1);
+		}
 	}
 
 	/**
@@ -176,8 +196,10 @@ export class FakeWebSocketInterface {
 	 */
 	async triggerError() {
 		await this.runAndResolve(() => {
-			// @ts-ignore
-			this.webSocket.onerror(new Event('TestError', {}));
+			if (this.webSocket.onerror) {
+				// @ts-ignore
+				this.webSocket.onerror(new Event('TestError', {}));
+			}
 		});
 	}
 
@@ -250,16 +272,25 @@ export class FakeWebSocketInterface {
 	async sendMessage(message: MessageEvent) {
 		// After a message is sent, it takes a few ms for it to enact provider behavior
 		await this.runAndResolve(() => {
-			// @ts-ignore
-			this.webSocket.onmessage(message);
+			if (this.webSocket.onmessage) {
+				// @ts-ignore
+				this.webSocket.onmessage(message);
+			}
 		});
 	}
 
 	/**
-	 * Run a command and resolve to allow internal behavior to execute
+	 * Run a command and resolve to allow internal behavior to execute.
+	 *
+	 * One macrotask turn, which drains every microtask the provider queued for
+	 * this event. A real socket event never arrives in the same turn as the work
+	 * it triggers, and the provider now builds a subscription's start frame from
+	 * the headers the connection resolved, so the frame is sent one turn after
+	 * the connection ack.
 	 */
 	async runAndResolve(fn: Function) {
 		await fn();
+		await delay(1);
 	}
 
 	/**

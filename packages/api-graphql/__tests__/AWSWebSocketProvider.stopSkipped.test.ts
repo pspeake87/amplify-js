@@ -15,6 +15,10 @@ import {
  * `subscriptionStopSkipped` Hub event on the `api` channel, so the app can
  * tell which path fires and whether the socket was really open. These tests
  * pin the dispatch — the skip behavior itself is unchanged.
+ *
+ * The reasons are 'never-connected', 'connect-failed', 'socket-not-ready',
+ * 'send-failed' and 'wait-timeout'. The last one is pinned in
+ * AWSWebSocketProvider.teardown.test.ts, beside the deadline that raises it.
  */
 describe('subscriptionStopSkipped instrumentation', () => {
 	let provider: AWSAppSyncRealTimeProvider;
@@ -62,6 +66,22 @@ describe('subscriptionStopSkipped instrumentation', () => {
 			queryName: 'onUpdateCattle',
 		});
 		// Behavior unchanged: local bookkeeping is still removed
+		expect((provider as any).subscriptionObserverMap.size).toBe(0);
+	});
+
+	test('cleanup of a PENDING subscription with no link is never-connected too', async () => {
+		const id = seedSubscription(SUBSCRIPTION_STATUS.PENDING);
+
+		await (provider as any)._cleanupSubscription(id, undefined);
+
+		// While realtime is down EVERY entry is PENDING. Waiting for an ack that
+		// no link can send is what froze a DataStore.clear() for hours.
+		const events = dispatchedEvents();
+		expect(events).toHaveLength(1);
+		expect(events[0].payload.data).toMatchObject({
+			reason: 'never-connected',
+			subscriptionState: SUBSCRIPTION_STATUS.PENDING,
+		});
 		expect((provider as any).subscriptionObserverMap.size).toBe(0);
 	});
 

@@ -8,5 +8,9 @@ export { events };
 export { GraphQLAPI, GraphQLAPIClass, graphqlOperation } from './GraphQLAPI';
 export * from './types';
 
-export { CONNECTION_STATE_CHANGE } from './Providers/constants';
+export {
+	CONNECTION_STATE_CHANGE,
+	REALTIME_CONNECTION_FAILURE,
+	REALTIME_RECOVERED,
+} from './Providers/constants';
 export * from './internals/events/types';

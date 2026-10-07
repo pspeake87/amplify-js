@@ -13,7 +13,14 @@ import {
 	dynamicAuthFields,
 	countFilterCombinations,
 	repeatedFieldInGroup,
+	getTokenForCustomAuth,
+	MissingAuthTokenError,
 } from '../src/sync/utils';
+import {
+	RequestTimeoutError,
+	TOKEN_REQUEST_TIMEOUT_MS,
+	TransientRequestError,
+} from '../src/sync/requestTimeout';
 import { DeferredCallbackResolver } from '../src/util';
 
 describe('DataStore - utils', () => {
@@ -589,6 +596,127 @@ _deleted`;
 			expect(limitTimerRaceCallback).toHaveBeenCalledTimes(0);
 
 			limitTimerRace.clear();
+		});
+	});
+
+	/**
+	 * The token stage of a realtime connect runs inside a recorded attempt, so
+	 * the failure it throws must name itself. The realtime layer classifies by
+	 * name, and the outbox decides by class.
+	 */
+	describe('getTokenForCustomAuth', () => {
+		const amplifyConfig = (functionAuthProvider: any) => ({
+			authProviders: { functionAuthProvider },
+		});
+
+		/** Drains the microtask queue without advancing fake timers. */
+		const flush = async () => {
+			for (let i = 0; i < 10; i++) {
+				await Promise.resolve();
+			}
+		};
+
+		afterEach(() => {
+			jest.useRealTimers();
+		});
+
+		test('throws MissingAuthTokenError on an empty token', async () => {
+			expect.assertions(2);
+			try {
+				await getTokenForCustomAuth(
+					'lambda',
+					amplifyConfig(async () => ({ token: '' })),
+				);
+			} catch (error: any) {
+				expect(error.name).toEqual('MissingAuthTokenError');
+				// the message the realtime classifier and `getClientSideAuthError`
+				// both match on
+				expect(error.message).toEqual('No auth token specified');
+			}
+		});
+
+		test('MissingAuthTokenError is an instanceof TransientRequestError', async () => {
+			// fork item 4: a write stays in the outbox, because every outbox
+			// decision is `instanceof TransientRequestError`
+			expect(new MissingAuthTokenError()).toBeInstanceOf(
+				TransientRequestError,
+			);
+			expect(new MissingAuthTokenError()).toBeInstanceOf(
+				MissingAuthTokenError,
+			);
+
+			await expect(
+				getTokenForCustomAuth(
+					'lambda',
+					amplifyConfig(async () => ({ token: undefined })),
+				),
+			).rejects.toBeInstanceOf(TransientRequestError);
+		});
+
+		test('a token read that never settles throws RequestTimeoutError, not a wrapped TransientRequestError', async () => {
+			jest.useFakeTimers();
+
+			const pending = getTokenForCustomAuth(
+				'lambda',
+				amplifyConfig(() => new Promise(() => undefined)),
+			);
+			const outcome = pending.then(
+				() => ({ ok: true }) as any,
+				error => ({ error }),
+			);
+
+			await jest.advanceTimersByTimeAsync(TOKEN_REQUEST_TIMEOUT_MS);
+
+			const { error } = await outcome;
+			expect(error).toBeInstanceOf(RequestTimeoutError);
+			expect(error.name).toEqual('RequestTimeoutError');
+			// the wrap that used to hide which of the two facts happened
+			expect(error.message).not.toMatch(/Error retrieving token/);
+		});
+
+		test('a provider that throws is still wrapped as a TransientRequestError', async () => {
+			await expect(
+				getTokenForCustomAuth(
+					'lambda',
+					amplifyConfig(async () => {
+						throw new Error('cookie read failed');
+					}),
+				),
+			).rejects.toMatchObject({
+				name: 'TransientRequestError',
+				message: expect.stringContaining('Error retrieving token'),
+			});
+		});
+
+		test('the 30 s limit is unchanged', async () => {
+			expect(TOKEN_REQUEST_TIMEOUT_MS).toEqual(30000);
+
+			jest.useFakeTimers();
+
+			let settled = false;
+			const pending = getTokenForCustomAuth(
+				'lambda',
+				amplifyConfig(() => new Promise(() => undefined)),
+			).catch(() => {
+				settled = true;
+			});
+
+			await jest.advanceTimersByTimeAsync(29999);
+			await flush();
+			expect(settled).toBe(false);
+
+			await jest.advanceTimersByTimeAsync(1);
+			await pending;
+			expect(settled).toBe(true);
+		});
+
+		test('a good token is returned unchanged', async () => {
+			await expect(
+				getTokenForCustomAuth(
+					'lambda',
+					amplifyConfig(async () => ({ token: 'a.b.c' })),
+				),
+			).resolves.toEqual('a.b.c');
 		});
 	});
 

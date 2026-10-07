@@ -9,7 +9,6 @@ import {
 	NonRetryableError,
 	amplifyUuid,
 	base64Encoder,
-	isNonRetryableError,
 	jitteredExponentialRetry,
 } from '@aws-amplify/core/internals/utils';
 
@@ -22,15 +21,26 @@ import {
 	AMPLIFY_SYMBOL,
 	CONNECTION_INIT_TIMEOUT,
 	CONNECTION_STATE_CHANGE,
+	CONNECT_ATTEMPT_BUDGET,
+	CONNECT_SOCKET_TIMEOUT,
 	DEFAULT_KEEP_ALIVE_ALERT_TIMEOUT,
 	DEFAULT_KEEP_ALIVE_HEARTBEAT_TIMEOUT,
+	HEADER_RESOLVE_TIMEOUT,
 	MAX_DELAY_MS,
 	MESSAGE_TYPES,
+	NEVER_CONNECTED_MESSAGE,
 	NON_RETRYABLE_CODES,
 	NON_RETRYABLE_ERROR_TYPES,
+	REALTIME_CONNECTION_FAILURE,
+	REALTIME_RECOVERED,
+	REALTIME_REPEAT_REPORT_MS,
+	REALTIME_REPORT_AFTER_FAILURES,
+	SOCKET_CLOSE_TIMEOUT,
 	SOCKET_STATUS,
 	START_ACK_TIMEOUT,
+	STOP_WAIT_TIMEOUT_MESSAGE,
 	SUBSCRIPTION_STATUS,
+	SUBSCRIPTION_STOP_WAIT_TIMEOUT,
 } from '../constants';
 import {
 	CONNECTION_CHANGE,
@@ -48,6 +58,16 @@ import {
 	realtimeUrlWithQueryString,
 } from './appsyncUrl';
 import { awsRealTimeHeaderBasedAuth } from './authHeaders';
+import {
+	AttemptBudgetError,
+	LinkPhase,
+	PhaseDeadlineError,
+	RealtimeConnectionFailure,
+	RealtimeDiagnostics,
+	RealtimeFailureReason,
+	StaleAttemptError,
+	classifyRealtimeFailure,
+} from './realtimeFailure';
 
 const dispatchApiEvent = (payload: HubPayload) => {
 	Hub.dispatch('api', payload, 'PubSub', AMPLIFY_SYMBOL);
@@ -61,6 +81,8 @@ export interface ObserverQuery {
 	subscriptionReadyCallback?(): void;
 	subscriptionFailedCallback?(reason?: any): void;
 	startAckTimeoutId?: ReturnType<typeof setTimeout>;
+	/** The link generation whose socket carries this subscription's GQL_START. */
+	startedGen?: number;
 }
 
 interface ParsedMessagePayload {
@@ -77,25 +99,65 @@ interface AWSWebSocketProviderArgs {
 	connectUri: string;
 }
 
+/**
+ * One connect attempt and the socket it owns. Its generation stamps every
+ * timer, socket callback and server message, so work that belongs to an
+ * abandoned attempt can never touch the live one.
+ */
+interface Link {
+	gen: number;
+	phase: LinkPhase;
+	socket?: WebSocket;
+	headers?: Record<string, string>;
+	libraryConfigHeaders?: Record<string, string>;
+	budgetTimer?: ReturnType<typeof setTimeout>;
+	phaseTimer?: ReturnType<typeof setTimeout>;
+	budgetReached: Promise<void>;
+	/**
+	 * Rejects the step this attempt is waiting on. Releasing a link disarms its
+	 * deadline, so without this the wait would have no settler left at all.
+	 */
+	abandon?(reason: unknown): void;
+}
+
 export abstract class AWSWebSocketProvider {
 	protected logger: ConsoleLogger;
 	protected subscriptionObserverMap = new Map<string, ObserverQuery>();
 	protected allowNoSubscriptions = false;
 
+	// Preserved by name and meaning: external diagnostics read all of these, so
+	// a rename silently loses them.
 	protected awsRealTimeSocket?: WebSocket;
 	private socketStatus: SOCKET_STATUS = SOCKET_STATUS.CLOSED;
+	private promiseArray: { res(): void; rej(reason?: any): void }[] = [];
 	private keepAliveTimestamp: number = Date.now();
 	private keepAliveHeartbeatIntervalId?: ReturnType<typeof setInterval>;
-	private promiseArray: { res(): void; rej(reason?: any): void }[] = [];
+
 	private connectionState: ConnectionState | undefined;
 	private readonly connectionStateMonitor = new ConnectionStateMonitor();
 	private readonly reconnectionMonitor = new ReconnectionMonitor();
 	private connectionStateMonitorSubscription: SubscriptionLike;
 	private readonly wsProtocolName: string;
 	private readonly wsConnectUri: string;
+	protected readonly providerName: string;
+
+	private generation = 0;
+	private link?: Link;
+	private lastFailure?: { gen: number; failure: RealtimeConnectionFailure };
+
+	// The failure episode: one signal per episode, not one per attempt.
+	private episodeId = 0;
+	private episodeStartedAt = 0;
+	private consecutiveFailures = 0;
+	private episodeReportedAt = 0;
+	private episodeSuspended = false;
+	private socketsAttemptedInEpisode = 0;
+	private failureReasons: Partial<Record<RealtimeFailureReason, number>> = {};
+	private lastConnectedAt = 0;
 
 	constructor(args: AWSWebSocketProviderArgs) {
 		this.logger = new ConsoleLogger(args.providerName);
+		this.providerName = args.providerName;
 		this.wsProtocolName = args.wsProtocolName;
 		this.wsConnectUri = args.connectUri;
 
@@ -104,11 +166,48 @@ export abstract class AWSWebSocketProvider {
 	}
 
 	/**
+	 * THE rule of this file. A socket, a timer or a server message may touch
+	 * shared state only while it belongs to the current link. Everything else is
+	 * a no-op.
+	 *
+	 * This one check replaces every ad hoc staleness guard. It rejects a stale
+	 * event in every phase, which is what stops a dead socket's late onclose
+	 * recording against a healthy connection and clearing its keep-alive.
+	 */
+	private isCurrent(gen: number): boolean {
+		return this.link?.gen === gen;
+	}
+
+	private entry(subscriptionId: string) {
+		return this.subscriptionObserverMap.get(subscriptionId);
+	}
+
+	/**
+	 * Merge, never replace. Writing a full entry silently dropped fields: a
+	 * replay dropped a concurrent unsubscribe's resolve/reject, and the
+	 * unsubscribe wait dropped startAckTimeoutId. One method closes both.
+	 *
+	 * A patch for a subscription that is already gone is dropped. Work in flight
+	 * outlives an unsubscribe, and a resurrected entry would hold the socket open
+	 * and be counted in every diagnostic, with no observer behind it.
+	 */
+	private updateEntry(subscriptionId: string, patch: Partial<ObserverQuery>) {
+		const current = this.subscriptionObserverMap.get(subscriptionId);
+		if (!current) {
+			return;
+		}
+		this.subscriptionObserverMap.set(subscriptionId, { ...current, ...patch });
+	}
+
+	/**
 	 * Mark the socket closed and release all active listeners
 	 */
-	close() {
-		// Mark the socket closed both in status and the connection monitor
+	async close() {
 		this.socketStatus = SOCKET_STATUS.CLOSED;
+
+		// Only here. A deliberate shutdown must halt reconnection, and
+		// CONNECTION_FAILED is what does that. It has no other caller: a failed
+		// attempt we intend to retry records CLOSED instead.
 		this.connectionStateMonitor.record(CONNECTION_CHANGE.CONNECTION_FAILED);
 
 		// Turn off the subscription monitor Hub publishing
@@ -116,24 +215,15 @@ export abstract class AWSWebSocketProvider {
 		// Complete all reconnect observers
 		this.reconnectionMonitor.close();
 
-		return new Promise<void>((resolve, reject) => {
-			if (this.awsRealTimeSocket) {
-				this.awsRealTimeSocket.onclose = (_: CloseEvent) => {
-					this._closeSocket();
-					this.subscriptionObserverMap = new Map();
-					this.awsRealTimeSocket = undefined;
-					resolve();
-				};
-
-				this.awsRealTimeSocket.onerror = (err: any) => {
-					reject(err);
-				};
-
-				this.awsRealTimeSocket.close();
-			} else {
-				resolve();
-			}
-		});
+		// A shutdown must not wait on the socket it is tearing down, so nothing
+		// here waits for an onclose that may never arrive.
+		const { link } = this;
+		this.link = undefined;
+		if (link) {
+			this.releaseLink(link);
+		}
+		this.subscriptionObserverMap = new Map();
+		this.rejectWaiters(new Error('Realtime provider closed'));
 	}
 
 	subscribe(
@@ -170,17 +260,12 @@ export abstract class AWSWebSocketProvider {
 						customUserAgentDetails,
 					})
 						.catch(err => {
-							this.logger.debug(
-								`${CONTROL_MSG.REALTIME_SUBSCRIPTION_INIT_ERROR}: ${err}`,
-							);
-							// The socket must genuinely close here, not just be recorded
-							// as disrupted: the ReconnectionMonitor replays every
-							// subscription with its original id, and AppSync scopes ids
-							// per connection — replaying onto the still-open socket is
-							// rejected with DuplicatedOperationError.
-							this._errorDisconnect(
-								CONTROL_MSG.REALTIME_SUBSCRIPTION_INIT_ERROR,
-							);
+							// The start path settles every failure itself, so nothing
+							// should reach here. A failure that does must still mark the
+							// entry and settle a concurrent unsubscribe. It must NOT touch
+							// the link: a connection-level failure already settled its own
+							// link and reported itself exactly once.
+							this._failStartSubscription(subscriptionId, observer, err);
 						})
 						.finally(() => {
 							subscriptionStartInProgress = false;
@@ -192,6 +277,15 @@ export abstract class AWSWebSocketProvider {
 			const reconnectSubscription = new Observable(
 				reconnectSubscriptionObserver => {
 					this.reconnectionMonitor.addObserver(reconnectSubscriptionObserver);
+
+					// rxjs calls this on unsubscribe. Without it the observer array
+					// grows for the life of the page and every replay walks the whole
+					// history.
+					return () => {
+						this.reconnectionMonitor.removeObserver(
+							reconnectSubscriptionObserver,
+						);
+					};
 				},
 			).subscribe(() => {
 				startSubscription();
@@ -208,11 +302,11 @@ export abstract class AWSWebSocketProvider {
 	protected async connect(
 		options: AWSAppSyncRealTimeProviderOptions,
 	): Promise<void> {
-		if (this.socketStatus === SOCKET_STATUS.READY) {
+		if (this.link?.phase === 'live') {
 			return;
 		}
 
-		await this._connectWebSocket(options);
+		await this.ensureLink(options);
 	}
 
 	protected async publish(
@@ -224,31 +318,6 @@ export abstract class AWSWebSocketProvider {
 		}
 
 		return this._publishMessage(options, customUserAgentDetails);
-	}
-
-	/**
-	 * @param resolvedHeaders headers the caller resolved already (the token
-	 * provider is then called one time per subscription start, not two)
-	 */
-	private async _connectWebSocket(
-		options: AWSAppSyncRealTimeProviderOptions,
-		resolvedHeaders?: Record<string, string>,
-	) {
-		const { apiKey, appSyncGraphqlEndpoint, authenticationType, region } =
-			options;
-
-		const additionalCustomHeaders =
-			resolvedHeaders ??
-			(await additionalHeadersFromOptions(options)).additionalCustomHeaders;
-
-		this.connectionStateMonitor.record(CONNECTION_CHANGE.OPENING_CONNECTION);
-		await this._initializeWebSocketConnection({
-			apiKey,
-			appSyncGraphqlEndpoint,
-			authenticationType,
-			region,
-			additionalCustomHeaders,
-		});
 	}
 
 	private async _publishMessage(
@@ -334,7 +403,7 @@ export abstract class AWSWebSocketProvider {
 	 */
 	private _dispatchStopSkipped(subscriptionId: string, reason: string) {
 		try {
-			const entry = this.subscriptionObserverMap.get(subscriptionId);
+			const entry = this.entry(subscriptionId);
 			dispatchApiEvent({
 				event: 'subscriptionStopSkipped',
 				data: {
@@ -357,16 +426,14 @@ export abstract class AWSWebSocketProvider {
 		subscriptionId: string,
 		reconnectSubscription: Subscription,
 	) {
-		// Cleanup reconnection subscription
-		reconnectSubscription?.unsubscribe();
-
-		// Cleanup after unsubscribing or observer.complete was called after _startSubscriptionWithAWSAppSyncRealTime
 		try {
-			// Waiting that subscription has been connected before trying to unsubscribe
+			// The reconnect observer is the ONLY thing that can settle the wait
+			// below. It is unsubscribed in `finally`, after the wait, never before
+			// it: unsubscribing first froze every teardown that happened while
+			// realtime was down.
 			await this._waitForSubscriptionToBeConnected(subscriptionId);
 
-			const { subscriptionState } =
-				this.subscriptionObserverMap.get(subscriptionId) || {};
+			const { subscriptionState } = this.entry(subscriptionId) ?? {};
 
 			if (!subscriptionState) {
 				// subscription already unsubscribed
@@ -376,22 +443,66 @@ export abstract class AWSWebSocketProvider {
 			if (subscriptionState === SUBSCRIPTION_STATUS.CONNECTED) {
 				this._sendUnsubscriptionMessage(subscriptionId);
 			} else {
-				throw new Error('Subscription never connected');
+				throw new Error(NEVER_CONNECTED_MESSAGE);
 			}
 		} catch (err) {
-			// Two ways here: the state check above threw ('Subscription never
-			// connected'), or _waitForSubscriptionToBeConnected rejected via
-			// subscriptionFailedCallback. Either way no GQL_STOP was sent.
+			const message = err instanceof Error ? err.message : '';
 			this._dispatchStopSkipped(
 				subscriptionId,
-				err instanceof Error && err.message === 'Subscription never connected'
+				message === NEVER_CONNECTED_MESSAGE
 					? 'never-connected'
-					: 'connect-failed',
+					: message === STOP_WAIT_TIMEOUT_MESSAGE
+						? 'wait-timeout'
+						: 'connect-failed',
 			);
 			this.logger.debug(`Error while unsubscribing ${err}`);
 		} finally {
 			this._removeSubscriptionObserver(subscriptionId);
+			reconnectSubscription?.unsubscribe();
 		}
+	}
+
+	// Waiting that subscription has been connected before trying to unsubscribe
+	private async _waitForSubscriptionToBeConnected(subscriptionId: string) {
+		const entry = this.entry(subscriptionId);
+		if (!entry || entry.subscriptionState !== SUBSCRIPTION_STATUS.PENDING) {
+			return;
+		}
+
+		// A GQL_START can still be acked only while a link exists: an attempt in
+		// flight (this start is queued behind it) or a live link that carried this
+		// start. With no link there is no possible settler, so the wait is not
+		// entered at all — it is not a safety margin, it is a hang. While realtime
+		// is down EVERY entry is PENDING, which is why a clear() while down froze.
+		const { link } = this;
+		const startedOnAnOlderLink =
+			entry.startedGen !== undefined && entry.startedGen !== link?.gen;
+		if (!link || (link.phase === 'live' && startedOnAnOlderLink)) {
+			throw new Error(NEVER_CONNECTED_MESSAGE);
+		}
+
+		return new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				reject(new Error(STOP_WAIT_TIMEOUT_MESSAGE));
+			}, SUBSCRIPTION_STOP_WAIT_TIMEOUT);
+
+			// updateEntry, so startAckTimeoutId is kept: replacing the entry here
+			// left an orphan 15 s timer behind.
+			this.updateEntry(subscriptionId, {
+				subscriptionReadyCallback: () => {
+					clearTimeout(timer);
+					resolve();
+				},
+				subscriptionFailedCallback: (reason?: any) => {
+					clearTimeout(timer);
+					reject(
+						reason instanceof Error
+							? reason
+							: new Error(NEVER_CONNECTED_MESSAGE),
+					);
+				},
+			});
+		});
 	}
 
 	// Monitor the connection state and pass changes along to Hub
@@ -402,11 +513,21 @@ export abstract class AWSWebSocketProvider {
 					event: CONNECTION_STATE_CHANGE,
 					data: {
 						provider: this,
+						providerName: this.providerName,
 						connectionState,
 					},
 					message: `Connection state is ${connectionState}`,
 				});
 				this.connectionState = connectionState;
+
+				// A failure while the device is offline is not a dead end, and the
+				// reconnect monitor is halted for it anyway. No DOM: the
+				// *PendingNetwork states come from ReachabilityMonitor, which has a
+				// React Native implementation.
+				this.episodeSuspended =
+					connectionState ===
+						ConnectionState.ConnectionDisruptedPendingNetwork ||
+					connectionState === ConnectionState.ConnectedPendingNetwork;
 
 				// Trigger START_RECONNECT when the connection is disrupted
 				if (connectionState === ConnectionState.ConnectionDisrupted) {
@@ -453,133 +574,152 @@ export abstract class AWSWebSocketProvider {
 	}) {
 		const { query, variables } = options;
 
+		// A replay for an id this live link already started is a no-op: AppSync
+		// scopes ids per connection and answers a repeat with
+		// DuplicatedOperationError. Checked BEFORE the map write, so a replay can
+		// never reset a CONNECTED entry back to PENDING and strand it with no ack
+		// timer.
+		if (
+			this.link?.phase === 'live' &&
+			this.entry(subscriptionId)?.startedGen === this.link.gen
+		) {
+			return;
+		}
+
 		// A replay reuses the subscription id. A start_ack timer of the previous
-		// attempt must not fire against this attempt's connection.
+		// attempt must not fire against this attempt's link.
 		const previousStartAckTimeoutId =
-			this.subscriptionObserverMap.get(subscriptionId)?.startAckTimeoutId;
+			this.entry(subscriptionId)?.startAckTimeoutId;
 		if (previousStartAckTimeoutId) {
 			clearTimeout(previousStartAckTimeoutId);
 		}
 
+		// The one write that may create the entry. It still merges, so a replay
+		// keeps a concurrent unsubscribe's callbacks.
 		this.subscriptionObserverMap.set(subscriptionId, {
+			...this.entry(subscriptionId),
 			observer,
 			query: query ?? '',
 			variables: variables ?? {},
 			subscriptionState: SUBSCRIPTION_STATUS.PENDING,
 			startAckTimeoutId: undefined,
+			startedGen: undefined,
 		});
 
-		const { additionalCustomHeaders, libraryConfigHeaders } =
-			await additionalHeadersFromOptions(options);
-
-		const serializedSubscriptionMessage =
-			await this._prepareSubscriptionPayload({
-				options,
-				subscriptionId,
-				customUserAgentDetails,
-				additionalCustomHeaders,
-				libraryConfigHeaders,
-			});
-
+		let link: Link;
 		try {
-			await this._connectWebSocket(options, additionalCustomHeaders);
-		} catch (err: any) {
-			this._logStartSubscriptionError(subscriptionId, observer, err);
+			// Single flight: the token is read once for this replay round, not once
+			// per subscription, and the whole round is one attempt, one failure.
+			link = await this.ensureLink(options);
+		} catch (err) {
+			this._failStartSubscription(subscriptionId, observer, err);
 
 			return;
 		}
 
-		// Potential race condition can occur when unsubscribe is called during _initializeWebSocketConnection.
-		// E.g.unsubscribe gets invoked prior to finishing WebSocket handshake or START_ACK.
-		// Both subscriptionFailedCallback and subscriptionReadyCallback are used to synchronized this.
-		const { subscriptionFailedCallback, subscriptionReadyCallback } =
-			this.subscriptionObserverMap.get(subscriptionId) ?? {};
+		try {
+			const serializedSubscriptionMessage =
+				await this._prepareSubscriptionPayload({
+					options,
+					subscriptionId,
+					customUserAgentDetails,
+					additionalCustomHeaders: link.headers ?? {},
+					libraryConfigHeaders: link.libraryConfigHeaders ?? {},
+				});
 
-		// This must be done before sending the message in order to be listening immediately
-		this.subscriptionObserverMap.set(subscriptionId, {
-			observer,
-			subscriptionState: SUBSCRIPTION_STATUS.PENDING,
-			query: query ?? '',
-			variables: variables ?? {},
-			subscriptionReadyCallback,
-			subscriptionFailedCallback,
-			startAckTimeoutId: setTimeout(() => {
-				this._timeoutStartSubscriptionAck(subscriptionId);
-			}, START_ACK_TIMEOUT),
-		});
+			if (!this.isCurrent(link.gen) || link.phase !== 'live' || !link.socket) {
+				// The link died while the payload was built. The next replay covers
+				// it; this is not a new connection-level failure.
+				this._failStartSubscription(
+					subscriptionId,
+					observer,
+					new Error('Realtime link is not live'),
+				);
 
-		if (this.awsRealTimeSocket) {
-			this.awsRealTimeSocket.send(serializedSubscriptionMessage);
+				return;
+			}
+
+			// Set before the send, so a start_ack that arrives in the same tick
+			// finds the entry.
+			this.updateEntry(subscriptionId, {
+				startedGen: link.gen,
+				startAckTimeoutId: setTimeout(() => {
+					this._timeoutStartSubscriptionAck(link.gen, subscriptionId);
+				}, START_ACK_TIMEOUT),
+			});
+
+			link.socket.send(serializedSubscriptionMessage);
+		} catch (err) {
+			this._failStartSubscription(subscriptionId, observer, err);
 		}
 	}
 
-	// Log logic for start subscription failures
-	private _logStartSubscriptionError(
+	/**
+	 * A start that failed. Connection-level reporting is already done, once, by
+	 * failAttempt, so this method is per subscription only.
+	 *
+	 * It must NOT call observer.error for an auth or a transient failure.
+	 * DataStore's SubscriptionProcessor unsubscribes the model's subscriptions
+	 * for any message containing 'Connection failed', and with one read auth mode
+	 * it never recreates them: 45 loud errors would kill realtime for the whole
+	 * session. Only a configuration error, which no replay can fix, errors the
+	 * observable.
+	 */
+	private _failStartSubscription(
 		subscriptionId: string,
 		observer: PubSubContentObserver,
-		err: { message?: string },
+		err: unknown,
 	) {
-		this.logger.debug({ err });
-		const message = String(err.message ?? '');
-		// Resolving to give the state observer time to propogate the update
-		this._closeSocket();
+		// A failed start must leave a trace even though the link is unharmed.
+		this.logger.debug(
+			`${CONTROL_MSG.REALTIME_SUBSCRIPTION_INIT_ERROR}: ${err}`,
+		);
 
-		// Capture the error only when the network didn't cause disruption
-		if (
-			this.connectionState !== ConnectionState.ConnectionDisruptedPendingNetwork
-		) {
-			// When the error is non-retriable, error out the observable
-			if (isNonRetryableError(err)) {
-				observer.error({
-					errors: [
-						{
-							...new GraphQLError(
-								`${CONTROL_MSG.CONNECTION_FAILED}: ${message}`,
-							),
-						},
-					],
-				});
-			} else {
-				this.logger.debug(`${CONTROL_MSG.CONNECTION_FAILED}: ${message}`);
-			}
+		this.updateEntry(subscriptionId, {
+			subscriptionState: SUBSCRIPTION_STATUS.FAILED,
+		});
 
-			const { subscriptionFailedCallback } =
-				this.subscriptionObserverMap.get(subscriptionId) || {};
+		const { subscriptionFailedCallback } = this.entry(subscriptionId) ?? {};
 
-			// Notify concurrent unsubscription
-			if (typeof subscriptionFailedCallback === 'function') {
-				subscriptionFailedCallback();
-			}
+		// Notify concurrent unsubscription
+		if (typeof subscriptionFailedCallback === 'function') {
+			subscriptionFailedCallback(err);
+		}
+
+		const reason = (err as RealtimeConnectionFailure | undefined)?.reason;
+		if (reason === 'config-error') {
+			observer.error({
+				errors: [
+					{
+						...new GraphQLError(
+							String((err as Error)?.message ?? CONTROL_MSG.CONNECTION_FAILED),
+						),
+					},
+				],
+			});
 		}
 	}
 
-	// Waiting that subscription has been connected before trying to unsubscribe
-	private async _waitForSubscriptionToBeConnected(subscriptionId: string) {
-		const subscriptionObserver =
-			this.subscriptionObserverMap.get(subscriptionId);
-
-		if (subscriptionObserver) {
-			const { subscriptionState } = subscriptionObserver;
-			// This in case unsubscribe is invoked before sending start subscription message
-			if (subscriptionState === SUBSCRIPTION_STATUS.PENDING) {
-				return new Promise<void>((resolve, reject) => {
-					const {
-						observer,
-						subscriptionState: observedSubscriptionState,
-						variables,
-						query,
-					} = subscriptionObserver;
-					this.subscriptionObserverMap.set(subscriptionId, {
-						observer,
-						subscriptionState: observedSubscriptionState,
-						variables,
-						query,
-						subscriptionReadyCallback: resolve,
-						subscriptionFailedCallback: reject,
-					});
-				});
-			}
+	private _timeoutStartSubscriptionAck(gen: number, subscriptionId: string) {
+		const entry = this.entry(subscriptionId);
+		if (!entry || entry.startedGen !== gen) {
+			// a stale timer from a previous link
+			return;
 		}
+		this.updateEntry(subscriptionId, {
+			subscriptionState: SUBSCRIPTION_STATUS.FAILED,
+			startAckTimeoutId: undefined,
+		});
+		this.logger.debug(
+			'timeoutStartSubscription',
+			JSON.stringify({ query: entry.query, variables: entry.variables }),
+		);
+
+		// The link must genuinely close: the ReconnectionMonitor replays every
+		// subscription with its original id, and AppSync scopes ids per
+		// connection, so a replay onto a still-open socket is rejected with
+		// DuplicatedOperationError.
+		this.loseLink(gen, CONTROL_MSG.TIMEOUT_DISCONNECT);
 	}
 
 	protected abstract _unsubscribeMessage(subscriptionId: string): {
@@ -626,28 +766,64 @@ export abstract class AWSWebSocketProvider {
 			return;
 		}
 
-		if (!this.awsRealTimeSocket) {
+		const { link } = this;
+		if (!link) {
+			// No subscriptions and no link: the provider is idle by intent.
+			// Publish that. Without it the last label stays ConnectionDisrupted,
+			// the reconnect monitor keeps replaying into an empty observer list,
+			// and a host reads a dead end where there is none.
 			this.socketStatus = SOCKET_STATUS.CLOSED;
+			this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSING_CONNECTION);
+			this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSED);
+			this.rejectWaiters(new Error('Realtime link closed'));
 
 			return;
 		}
+		if (link.phase === 'closing') {
+			return;
+		}
 
+		const { gen } = link;
+		const previousPhase = link.phase;
+		const wasLive = previousPhase === 'live';
+		link.phase = 'closing';
 		this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSING_CONNECTION);
 
-		if (this.awsRealTimeSocket.bufferedAmount > 0) {
-			// Still data on the WebSocket
-			setTimeout(this._closeSocketIfRequired.bind(this), 1000);
-		} else {
-			this.logger.debug('closing WebSocket...');
+		const finish = () => {
+			if (!this.isCurrent(gen) || link.phase !== 'closing') {
+				return;
+			}
+			if (this.subscriptionObserverMap.size > 0) {
+				// A subscription arrived while we were closing: keep the link, put it
+				// back in the phase it was interrupted in, and put the published
+				// label back where it was.
+				link.phase = previousPhase;
+				this.connectionStateMonitor.record(
+					CONNECTION_CHANGE.OPENING_CONNECTION,
+				);
+				if (wasLive) {
+					this.connectionStateMonitor.record(
+						CONNECTION_CHANGE.CONNECTION_ESTABLISHED,
+					);
+				}
 
-			const tempSocket = this.awsRealTimeSocket;
-			// Cleaning callbacks to avoid race condition, socket still exists
-			tempSocket.onclose = null;
-			tempSocket.onerror = null;
-			tempSocket.close(1000);
-			this.awsRealTimeSocket = undefined;
-			this.socketStatus = SOCKET_STATUS.CLOSED;
-			this._closeSocket();
+				return;
+			}
+			this.logger.debug('closing WebSocket...');
+			this.releaseLink(link);
+			this.link = undefined;
+			this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSED);
+			this.rejectWaiters(new Error('Realtime link closed'));
+		};
+
+		// ONE grace period for a buffered send, then the close happens anyway.
+		// Rescheduling itself while bufferedAmount stayed above zero meant a
+		// teardown could never complete and the label never left
+		// ConnectedPendingDisconnect.
+		if (link.socket && link.socket.bufferedAmount > 0) {
+			setTimeout(finish, SOCKET_CLOSE_TIMEOUT);
+		} else {
+			finish();
 		}
 	}
 
@@ -671,7 +847,12 @@ export abstract class AWSWebSocketProvider {
 		this.keepAliveTimestamp = Date.now();
 	}
 
-	private keepAliveHeartbeat(connectionTimeoutMs: number) {
+	private keepAliveHeartbeat(gen: number, connectionTimeoutMs: number) {
+		if (!this.isCurrent(gen)) {
+			// a stale tick never records
+			return;
+		}
+
 		const currentTime = Date.now();
 
 		// Check for missed KA message
@@ -686,7 +867,7 @@ export abstract class AWSWebSocketProvider {
 
 		// Recognize we are disconnected if we haven't seen messages in the keep alive timeout period
 		if (currentTime - this.keepAliveTimestamp > connectionTimeoutMs) {
-			this._errorDisconnect(CONTROL_MSG.TIMEOUT_DISCONNECT);
+			this.loseLink(gen, CONTROL_MSG.TIMEOUT_DISCONNECT);
 		}
 	}
 
@@ -711,7 +892,7 @@ export abstract class AWSWebSocketProvider {
 			startAckTimeoutId,
 			subscriptionReadyCallback,
 			subscriptionFailedCallback,
-		} = this.subscriptionObserverMap.get(id) || {};
+		} = this.entry(id) || {};
 
 		if (
 			type === MESSAGE_TYPES.GQL_START_ACK ||
@@ -729,21 +910,18 @@ export abstract class AWSWebSocketProvider {
 				data: { query, variables },
 				message: 'Connection established for subscription',
 			});
-			const subscriptionState = SUBSCRIPTION_STATUS.CONNECTED;
 			if (observer) {
-				this.subscriptionObserverMap.set(id, {
-					observer,
-					query,
-					variables,
+				this.updateEntry(id, {
 					startAckTimeoutId: undefined,
-					subscriptionState,
-					subscriptionReadyCallback,
-					subscriptionFailedCallback,
+					subscriptionState: SUBSCRIPTION_STATUS.CONNECTED,
 				});
 			}
 			this.connectionStateMonitor.record(
 				CONNECTION_CHANGE.CONNECTION_ESTABLISHED,
 			);
+			// Realtime works end to end — the server acked a start. This, not an
+			// open socket, is what closes a failure episode.
+			this.onRealtimeWorking();
 
 			return;
 		}
@@ -758,16 +936,9 @@ export abstract class AWSWebSocketProvider {
 			type === MESSAGE_TYPES.GQL_ERROR ||
 			type === MESSAGE_TYPES.EVENT_SUBSCRIBE_ERROR
 		) {
-			const subscriptionState = SUBSCRIPTION_STATUS.FAILED;
 			if (observer) {
-				this.subscriptionObserverMap.set(id, {
-					observer,
-					query,
-					variables,
-					startAckTimeoutId,
-					subscriptionReadyCallback,
-					subscriptionFailedCallback,
-					subscriptionState,
+				this.updateEntry(id, {
+					subscriptionState: SUBSCRIPTION_STATUS.FAILED,
 				});
 
 				let errorMessage = JSON.stringify(payload ?? data);
@@ -804,15 +975,14 @@ export abstract class AWSWebSocketProvider {
 
 				this.logger.debug(`${CONTROL_MSG.CONNECTION_FAILED}: ${errorMessage}`);
 
-				// On auth errors, close the socket to trigger reconnection with fresh tokens.
-				// The onclose handler fires _errorDisconnect → CONNECTION_CLOSED, which the
-				// ConnectionStateMonitor picks up as ConnectionDisrupted and the
-				// ReconnectionMonitor reconnects with refreshed credentials.
-				if (isAuthError && this.awsRealTimeSocket) {
+				// On auth errors, lose the link so the stack reconnects with fresh
+				// credentials. loseLink closes the socket itself, so the recovery no
+				// longer depends on the socket's own onclose arriving.
+				if (isAuthError && this.link?.phase === 'live') {
 					this.logger.warn(
 						'Subscription failed due to auth error, closing WebSocket to trigger reconnection with fresh tokens',
 					);
-					this.awsRealTimeSocket.close(1000, 'Auth error - reconnecting');
+					this.loseLink(this.link.gen, CONTROL_MSG.CONNECTION_FAILED);
 				}
 
 				observer.error({
@@ -834,172 +1004,268 @@ export abstract class AWSWebSocketProvider {
 		}
 	}
 
-	private _errorDisconnect(msg: string) {
-		this.logger.debug(`Disconnect error: ${msg}`);
-
-		if (this.socketStatus === SOCKET_STATUS.CONNECTING) {
-			// A connection attempt is in progress. This error belongs to the
-			// previous socket (its onclose, a stale timer). Marking the status
-			// CLOSED now would let the next subscription open a second socket
-			// in parallel and leak the one that is connecting.
-			this.logger.debug(
-				'Disconnect error ignored: a connection is in progress',
-			);
-
-			return;
+	/**
+	 * Single flight. Every caller of a down link awaits the same attempt, so the
+	 * token is read once per attempt instead of once per subscription, one replay
+	 * round is exactly one attempt, and one failure is one failure. The existence
+	 * of `this.link` IS the lock: there is no separate attempt id to keep in step
+	 * with it.
+	 */
+	private async ensureLink(
+		options: AWSAppSyncRealTimeProviderOptions,
+	): Promise<Link> {
+		if (this.link?.phase === 'live') {
+			return this.link;
 		}
 
-		if (this.awsRealTimeSocket) {
-			this._closeSocket();
-			this.awsRealTimeSocket.close();
-		}
-
-		this.socketStatus = SOCKET_STATUS.CLOSED;
-	}
-
-	private _closeSocket() {
-		if (this.keepAliveHeartbeatIntervalId) {
-			clearInterval(this.keepAliveHeartbeatIntervalId);
-			this.keepAliveHeartbeatIntervalId = undefined;
-		}
-		this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSED);
-	}
-
-	private _timeoutStartSubscriptionAck(subscriptionId: string) {
-		const subscriptionObserver =
-			this.subscriptionObserverMap.get(subscriptionId);
-		if (subscriptionObserver) {
-			const { observer, query, variables } = subscriptionObserver;
-			if (!observer) {
-				return;
-			}
-			this.subscriptionObserverMap.set(subscriptionId, {
-				observer,
-				query,
-				variables,
-				subscriptionState: SUBSCRIPTION_STATUS.FAILED,
+		if (this.link) {
+			// An attempt is in flight. Wait for ITS settlement, never start a
+			// second. Every exit that clears this.link drains promiseArray, so this
+			// wait always ends.
+			return new Promise<Link>((resolve, reject) => {
+				this.promiseArray.push({
+					res: () => {
+						const live = this.link?.phase === 'live' ? this.link : undefined;
+						if (live) {
+							resolve(live);
+						} else {
+							reject(new Error('Realtime link is not live'));
+						}
+					},
+					rej: reject,
+				});
 			});
+		}
 
-			// The socket must genuinely close here, not just be recorded as
-			// disrupted: the ReconnectionMonitor replays every subscription with
-			// its original id, and AppSync scopes ids per connection — replaying
-			// onto the still-open socket is rejected with DuplicatedOperationError.
-			this._errorDisconnect(CONTROL_MSG.TIMEOUT_DISCONNECT);
-			this.logger.debug(
-				'timeoutStartSubscription',
-				JSON.stringify({ query, variables }),
-			);
+		return this.startAttempt(options);
+	}
+
+	private async startAttempt(
+		options: AWSAppSyncRealTimeProviderOptions,
+	): Promise<Link> {
+		const gen = ++this.generation;
+		let reachBudget!: () => void;
+		const link: Link = {
+			gen,
+			phase: 'headers',
+			budgetReached: new Promise<void>(resolve => {
+				reachBudget = resolve;
+			}),
+		};
+		this.link = link;
+		this.socketStatus = SOCKET_STATUS.CONNECTING;
+
+		// The attempt's first and only trace. NOTHING that can fail or hang may
+		// run above this line. A failure above it cannot be told apart from "no
+		// attempt was made", because the state monitor publishes nothing for a
+		// state the page already holds, and the reconnect watchdog and every
+		// host-side detector read only published state.
+		this.connectionStateMonitor.record(CONNECTION_CHANGE.OPENING_CONNECTION);
+
+		link.budgetTimer = setTimeout(() => {
+			reachBudget();
+			this.failAttempt(gen, new AttemptBudgetError(CONNECT_ATTEMPT_BUDGET));
+		}, CONNECT_ATTEMPT_BUDGET);
+
+		try {
+			// The backstop settles this chain too, not only the shared state: a
+			// pending promise cannot be cancelled, so a step that somehow has no
+			// deadline of its own would otherwise hold this caller for ever.
+			await Promise.race([
+				this.runConnect(gen, link, options),
+				link.budgetReached.then((): never => {
+					throw new AttemptBudgetError(CONNECT_ATTEMPT_BUDGET);
+				}),
+			]);
+
+			this.onLinkLive(gen);
+
+			return link;
+		} catch (err) {
+			// Idempotent: a phase deadline or the budget may have run first.
+			throw this.failAttempt(gen, err) ?? err;
 		}
 	}
 
-	private _initializeWebSocketConnection({
-		appSyncGraphqlEndpoint,
-		authenticationType,
-		apiKey,
-		region,
-		additionalCustomHeaders,
-	}: AWSAppSyncRealTimeProviderOptions) {
-		if (this.socketStatus === SOCKET_STATUS.READY) {
-			return;
-		}
-
-		// TODO(Eslint): refactor to now use async function as the promise executor
-		// eslint-disable-next-line no-async-promise-executor
-		return new Promise<void>(async (resolve, reject) => {
-			this.promiseArray.push({ res: resolve, rej: reject });
-
-			if (this.socketStatus === SOCKET_STATUS.CLOSED) {
-				try {
-					this.socketStatus = SOCKET_STATUS.CONNECTING;
-
-					// Empty payload on connect
-					const payloadString = '{}';
-
-					const authHeader = await awsRealTimeHeaderBasedAuth({
-						authenticationType,
-						payload: payloadString,
-						canonicalUri: this.wsConnectUri,
-						apiKey,
-						appSyncGraphqlEndpoint,
-						region,
-						additionalCustomHeaders,
-					});
-
-					const headerString = authHeader ? JSON.stringify(authHeader) : '';
-					// base64url-encoded string
-					const encodedHeader = base64Encoder.convert(headerString, {
-						urlSafe: true,
-						skipPadding: true,
-					});
-
-					const authTokenSubprotocol = `header-${encodedHeader}`;
-
-					const queryParams = queryParamsFromCustomHeaders(
-						additionalCustomHeaders,
-					);
-
-					const awsRealTimeUrl = realtimeUrlWithQueryString(
-						appSyncGraphqlEndpoint,
-						queryParams,
-					);
-
-					await this._establishRetryableConnection(
-						awsRealTimeUrl,
-						authTokenSubprotocol,
-					);
-
-					this.promiseArray.forEach(({ res }) => {
-						this.logger.debug('Notifying connection successful');
-						res();
-					});
-					this.socketStatus = SOCKET_STATUS.READY;
-					this.promiseArray = [];
-				} catch (err) {
-					this.logger.debug('Connection exited with', err);
-					this.promiseArray.forEach(({ rej }) => {
-						rej(err);
-					});
-					this.promiseArray = [];
-					if (
-						this.awsRealTimeSocket &&
-						this.awsRealTimeSocket.readyState === WebSocket.OPEN
-					) {
-						this.awsRealTimeSocket.close(3001);
-					}
-					this.awsRealTimeSocket = undefined;
-					this.socketStatus = SOCKET_STATUS.CLOSED;
-				}
-			}
-		});
-	}
-
-	private async _establishRetryableConnection(
-		awsRealTimeUrl: string,
-		subprotocol: string,
+	/** The two bounded stages of one attempt: the credentials, then the socket. */
+	private async runConnect(
+		gen: number,
+		link: Link,
+		options: AWSAppSyncRealTimeProviderOptions,
 	) {
-		this.logger.debug(`Establishing retryable connection`);
+		// One deadline for the whole credential stage: the host's token thunk, the
+		// custom headers, and the signing that needs them. Signing can read
+		// credentials over the network, so it must not sit outside a deadline.
+		const subprotocol = await this.withPhaseDeadline(
+			gen,
+			'headers',
+			HEADER_RESOLVE_TIMEOUT,
+			async () => {
+				const resolved = await additionalHeadersFromOptions(options);
+				if (!this.isCurrent(gen)) {
+					throw new StaleAttemptError();
+				}
+				link.headers = resolved.additionalCustomHeaders as Record<
+					string,
+					string
+				>;
+				link.libraryConfigHeaders = resolved.libraryConfigHeaders as Record<
+					string,
+					string
+				>;
+
+				return this.authSubprotocol(options, link.headers);
+			},
+		);
+
+		const url = realtimeUrlWithQueryString(
+			options.appSyncGraphqlEndpoint!,
+			queryParamsFromCustomHeaders(link.headers),
+		);
+
 		await jitteredExponentialRetry(
 			this._establishConnection.bind(this),
-			[awsRealTimeUrl, subprotocol],
+			[url, subprotocol, gen],
 			MAX_DELAY_MS,
+			link.budgetReached,
 		);
 	}
 
-	private async _openConnection(awsRealTimeUrl: string, subprotocol: string) {
+	/**
+	 * The signed subprotocol this attempt connects with. No network for lambda
+	 * auth; iam and userPool read credentials here, which is why the caller
+	 * bounds it.
+	 */
+	private async authSubprotocol(
+		options: AWSAppSyncRealTimeProviderOptions,
+		additionalCustomHeaders: Record<string, string>,
+	): Promise<string> {
+		const { apiKey, appSyncGraphqlEndpoint, authenticationType, region } =
+			options;
+
+		const authHeader = await awsRealTimeHeaderBasedAuth({
+			authenticationType,
+			// Empty payload on connect
+			payload: '{}',
+			canonicalUri: this.wsConnectUri,
+			apiKey,
+			appSyncGraphqlEndpoint,
+			region,
+			additionalCustomHeaders,
+		});
+
+		const headerString = authHeader ? JSON.stringify(authHeader) : '';
+		// base64url-encoded string
+		const encodedHeader = base64Encoder.convert(headerString, {
+			urlSafe: true,
+			skipPadding: true,
+		});
+
+		return `header-${encodedHeader}`;
+	}
+
+	/**
+	 * Every wait on an external event goes through here. On the deadline the
+	 * WHOLE attempt is settled (failAttempt), not only this one promise. A
+	 * deadline that abandons its own step and leaves the chain waiting is the
+	 * bug this file is written around.
+	 */
+	private withPhaseDeadline<T>(
+		gen: number,
+		phase: LinkPhase,
+		ms: number,
+		run: () => Promise<T>,
+	): Promise<T> {
+		const { link } = this;
+		if (!link || link.gen !== gen) {
+			return Promise.reject(new StaleAttemptError());
+		}
+		link.phase = phase;
+
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				const err = new PhaseDeadlineError(phase, ms);
+				reject(err);
+				this.failAttempt(gen, err);
+			}, ms);
+			const clear = () => {
+				clearTimeout(timer);
+				if (link.phaseTimer === timer) {
+					link.phaseTimer = undefined;
+				}
+				if (link.abandon === reject) {
+					link.abandon = undefined;
+				}
+			};
+			link.phaseTimer = timer;
+			link.abandon = reject;
+			run().then(
+				value => {
+					clear();
+					resolve(value);
+				},
+				err => {
+					clear();
+					reject(err);
+				},
+			);
+		});
+	}
+
+	private async _openConnection(
+		awsRealTimeUrl: string,
+		subprotocol: string,
+		gen: number,
+	) {
 		return new Promise<void>((resolve, reject) => {
+			const { link } = this;
+			if (!link || link.gen !== gen) {
+				reject(new StaleAttemptError());
+
+				return;
+			}
+
+			const previousSocket = link.socket;
 			const newSocket = this._getNewWebSocket(awsRealTimeUrl, [
 				this.wsProtocolName,
 				subprotocol,
 			]);
 
+			// Claimed SYNCHRONOUSLY, before any handler can fire and before any
+			// deadline can expire. releaseLink closes link.socket, so a socket
+			// referenced only from inside onopen would be left in CONNECTING for
+			// ever when the open deadline fires — one leaked socket per attempt.
+			link.socket = newSocket;
+			// Counted at creation, not at onopen: a socket that never opens is
+			// exactly the shape the diagnostic must show (0 = the failure came
+			// before any socket, 1 or more = a socket was tried).
+			this.socketsAttemptedInEpisode += 1;
+			if (previousSocket && previousSocket !== newSocket) {
+				// A retry inside this attempt replaces the socket.
+				this.discardSocket(previousSocket);
+			}
+
 			newSocket.onerror = () => {
-				this.logger.debug(`WebSocket connection error`);
+				// A socket that errors and never closes was an unbounded wait; this
+				// rejection ends it before the deadline has to.
+				this.logger.debug('WebSocket connection error');
+				if (this.isCurrent(gen)) {
+					reject(new Error('Connection handshake error'));
+				}
 			};
 			newSocket.onclose = () => {
-				this._closeSocket();
-				reject(new Error('Connection handshake error'));
+				this.logger.debug('WebSocket closed before it opened');
+				if (this.isCurrent(gen)) {
+					reject(new Error('Connection handshake error'));
+				}
 			};
 			newSocket.onopen = () => {
+				if (!this.isCurrent(gen) || link.socket !== newSocket) {
+					this.discardSocket(newSocket);
+					reject(new StaleAttemptError());
+
+					return;
+				}
 				this.awsRealTimeSocket = newSocket;
 				resolve();
 			};
@@ -1010,28 +1276,29 @@ export abstract class AWSWebSocketProvider {
 		return new WebSocket(url, protocol);
 	}
 
-	private async _initiateHandshake(): Promise<string> {
+	private async _initiateHandshake(gen: number): Promise<string> {
 		return new Promise((resolve, reject) => {
-			if (!this.awsRealTimeSocket) {
-				reject(new Error('awsRealTimeSocket undefined'));
+			const { link } = this;
+			const socket = link?.socket;
+			if (!link || link.gen !== gen || !socket) {
+				reject(new StaleAttemptError());
 
 				return;
 			}
 
-			let ackOk = false;
-
-			this.awsRealTimeSocket.onerror = error => {
+			socket.onerror = error => {
 				this.logger.debug(`WebSocket error ${JSON.stringify(error)}`);
 			};
 
-			this.awsRealTimeSocket.onclose = event => {
+			socket.onclose = event => {
 				this.logger.debug(`WebSocket closed ${event.reason}`);
-				this._closeSocket();
-				reject(new Error(JSON.stringify(event)));
+				if (this.isCurrent(gen)) {
+					reject(new Error('Connection closed during the handshake'));
+				}
 			};
 
-			this.awsRealTimeSocket.onmessage = (message: MessageEvent) => {
-				if (typeof message.data !== 'string') {
+			socket.onmessage = (message: MessageEvent) => {
+				if (typeof message.data !== 'string' || !this.isCurrent(gen)) {
 					return;
 				}
 				this.logger.debug(
@@ -1039,14 +1306,13 @@ export abstract class AWSWebSocketProvider {
 				);
 
 				const data = JSON.parse(message.data) as ParsedMessagePayload;
-
 				const { type } = data;
 
-				const connectionTimeoutMs = this._extractConnectionTimeout(data);
-
 				if (type === MESSAGE_TYPES.GQL_CONNECTION_ACK) {
-					ackOk = true;
-					this._registerWebsocketHandlers(connectionTimeoutMs);
+					this._registerWebsocketHandlers(
+						gen,
+						this._extractConnectionTimeout(data),
+					);
 					resolve('Connected to AWS AppSyncRealTime');
 
 					return;
@@ -1061,52 +1327,46 @@ export abstract class AWSWebSocketProvider {
 				}
 			};
 
-			const gqlInit = {
-				type: MESSAGE_TYPES.GQL_CONNECTION_INIT,
-			};
-			this.awsRealTimeSocket.send(JSON.stringify(gqlInit));
-
-			const checkAckOk = (targetAckOk: boolean) => {
-				if (!targetAckOk) {
-					this.connectionStateMonitor.record(
-						CONNECTION_CHANGE.CONNECTION_FAILED,
-					);
-					reject(
-						new Error(
-							`Connection timeout: ack from AWSAppSyncRealTime was not received after ${CONNECTION_INIT_TIMEOUT} ms`,
-						),
-					);
-				}
-			};
-
-			setTimeout(() => {
-				checkAckOk(ackOk);
-			}, CONNECTION_INIT_TIMEOUT);
+			socket.send(JSON.stringify({ type: MESSAGE_TYPES.GQL_CONNECTION_INIT }));
 		});
 	}
 
-	private _registerWebsocketHandlers(connectionTimeoutMs: number) {
-		if (!this.awsRealTimeSocket) {
+	private _registerWebsocketHandlers(gen: number, connectionTimeoutMs: number) {
+		const { link } = this;
+		if (!link || link.gen !== gen || !link.socket) {
 			return;
 		}
+		const { socket } = link;
 
-		// Set up a keep alive heartbeat for this connection
+		// The link is live from the connection ack, not from the end of the
+		// connect chain: from this instant a socket failure is a lost live link
+		// and must be recorded, never swallowed.
+		link.phase = 'live';
+
+		this.keepAliveTimestamp = Date.now();
+		// releaseLink is the only owner of this handle and clears it on every
+		// exit. Overwriting it without clearing leaked one 5 s interval per
+		// connection for the life of the page.
 		this.keepAliveHeartbeatIntervalId = setInterval(() => {
-			this.keepAliveHeartbeat(connectionTimeoutMs);
+			this.keepAliveHeartbeat(gen, connectionTimeoutMs);
 		}, DEFAULT_KEEP_ALIVE_HEARTBEAT_TIMEOUT);
 
-		this.awsRealTimeSocket.onmessage =
-			this._handleIncomingSubscriptionMessage.bind(this);
-
-		this.awsRealTimeSocket.onerror = err => {
-			this.logger.debug(err);
-			this._errorDisconnect(CONTROL_MSG.CONNECTION_CLOSED);
+		socket.onmessage = (message: MessageEvent) => {
+			if (!this.isCurrent(gen)) {
+				// a stale socket never pushes data
+				return;
+			}
+			this._handleIncomingSubscriptionMessage(message);
 		};
 
-		this.awsRealTimeSocket.onclose = event => {
+		socket.onerror = err => {
+			this.logger.debug(err);
+			this.loseLink(gen, CONTROL_MSG.CONNECTION_CLOSED);
+		};
+
+		socket.onclose = event => {
 			this.logger.debug(`WebSocket closed ${event.reason}`);
-			this._closeSocket();
-			this._errorDisconnect(CONTROL_MSG.CONNECTION_CLOSED);
+			this.loseLink(gen, CONTROL_MSG.CONNECTION_CLOSED);
 		};
 	}
 
@@ -1114,16 +1374,25 @@ export abstract class AWSWebSocketProvider {
 	 * Open WebSocket connection & perform handshake
 	 * Ref: https://docs.aws.amazon.com/appsync/latest/devguide/real-time-websocket-client.html#appsynclong-real-time-websocket-client-implementation-guide-for-graphql-subscriptions
 	 *
-	 * @param subprotocol -
+	 * Both steps are bounded. The deadlines are non-retryable, so a step that
+	 * does not answer ends the attempt instead of being retried.
 	 */
-	private _establishConnection = async (
+	private async _establishConnection(
 		awsRealTimeUrl: string,
 		subprotocol: string,
-	) => {
+		gen: number,
+	) {
 		this.logger.debug(`Establishing WebSocket connection to ${awsRealTimeUrl}`);
 		try {
-			await this._openConnection(awsRealTimeUrl, subprotocol);
-			await this._initiateHandshake();
+			await this.withPhaseDeadline(gen, 'open', CONNECT_SOCKET_TIMEOUT, () =>
+				this._openConnection(awsRealTimeUrl, subprotocol, gen),
+			);
+			await this.withPhaseDeadline(
+				gen,
+				'handshake',
+				CONNECTION_INIT_TIMEOUT,
+				() => this._initiateHandshake(gen),
+			);
 		} catch (err) {
 			const { errorType, errorCode } = err as {
 				errorType: string;
@@ -1136,12 +1405,292 @@ export abstract class AWSWebSocketProvider {
 				// For now fall back to also checking known non-retryable error types
 				NON_RETRYABLE_ERROR_TYPES.includes(errorType)
 			) {
-				throw new NonRetryableError(errorType);
+				// NonRetryableError carries only a message, so the type would be lost
+				// and the classifier would read 'unknown'. Re-attach it.
+				const fatal = new NonRetryableError(errorType);
+				(fatal as any).errorType = errorType;
+				(fatal as any).errorCode = errorCode;
+				throw fatal;
 			} else if (errorType) {
-				throw new Error(errorType);
+				const retryable = new Error(errorType);
+				(retryable as any).errorType = errorType;
+				throw retryable;
 			} else {
 				throw err;
 			}
 		}
-	};
+	}
+
+	/**
+	 * A socket that is not the current link's: silence it, then close it for real
+	 * so AppSync releases its subscriptions and a replay can never be answered
+	 * with DuplicatedOperationError.
+	 */
+	private discardSocket(socket?: WebSocket) {
+		if (!socket) {
+			return;
+		}
+		socket.onopen = null;
+		socket.onerror = null;
+		socket.onclose = null;
+		socket.onmessage = null;
+		try {
+			// Skip only a socket that is already going away; everything else,
+			// including a socket with no readyState to read, gets a real close.
+			if (
+				socket.readyState !== WebSocket.CLOSING &&
+				socket.readyState !== WebSocket.CLOSED
+			) {
+				socket.close(3001);
+			}
+		} catch (err) {
+			this.logger.debug('Failed to close a discarded socket', err);
+		}
+	}
+
+	/** No timer of a settled attempt may still be armed. */
+	private clearLinkTimers(link: Link) {
+		if (link.budgetTimer) {
+			clearTimeout(link.budgetTimer);
+			link.budgetTimer = undefined;
+		}
+		if (link.phaseTimer) {
+			clearTimeout(link.phaseTimer);
+			link.phaseTimer = undefined;
+		}
+	}
+
+	/** The one place that frees an attempt's resources. */
+	private releaseLink(link: Link) {
+		this.clearLinkTimers(link);
+		// The step this attempt was waiting on has just lost its deadline, so
+		// nothing else could ever settle it.
+		const { abandon } = link;
+		link.abandon = undefined;
+		abandon?.(new StaleAttemptError());
+		if (this.keepAliveHeartbeatIntervalId) {
+			clearInterval(this.keepAliveHeartbeatIntervalId);
+			this.keepAliveHeartbeatIntervalId = undefined;
+		}
+		this.discardSocket(link.socket);
+		if (this.awsRealTimeSocket === link.socket) {
+			this.awsRealTimeSocket = undefined;
+		}
+		this.socketStatus = SOCKET_STATUS.CLOSED;
+	}
+
+	/**
+	 * No exit may leave a waiter parked: a parked waiter holds its caller's start
+	 * latch for ever.
+	 */
+	private rejectWaiters(reason: unknown) {
+		const waiters = this.promiseArray;
+		this.promiseArray = [];
+		waiters.forEach(({ rej }) => {
+			rej(reason);
+		});
+	}
+
+	/**
+	 * The single terminal transition for a link that never went live. Idempotent
+	 * and generation guarded, so a phase deadline, the budget, a socket callback
+	 * and the awaited rejection may all call it and only the first one acts.
+	 * Returns the failure so every path reports the same reason.
+	 */
+	private failAttempt(
+		gen: number,
+		err: unknown,
+	): RealtimeConnectionFailure | undefined {
+		if (!this.isCurrent(gen)) {
+			return this.lastFailure?.gen === gen
+				? this.lastFailure.failure
+				: undefined;
+		}
+		const link = this.link!;
+		const { phase } = link;
+		// Read before the release: what the attempt was doing is the diagnostic,
+		// and releaseLink sets the status to CLOSED.
+		const socketStatus = SOCKET_STATUS[this.socketStatus];
+
+		this.releaseLink(link);
+		this.link = undefined;
+
+		// CLOSED, never CONNECTION_FAILED. CONNECTION_FAILED sets
+		// intendedConnectionState to 'disconnected', which publishes Disconnected,
+		// fires HALT_RECONNECT and disables network monitoring — a permanent dead
+		// end. A failed attempt we intend to retry is ConnectionDisrupted.
+		this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSED);
+
+		const failure = this.recordEpisodeFailure(err, phase, socketStatus);
+		this.lastFailure = { gen, failure };
+
+		// The deadline settles the whole chain, not only its own step: every
+		// parked ensureLink waiter rejects here, so every start latch is released
+		// by its `.finally`.
+		this.rejectWaiters(failure);
+
+		return failure;
+	}
+
+	/** The attempt succeeded: tell everyone who was waiting for it. */
+	private onLinkLive(gen: number) {
+		if (!this.isCurrent(gen)) {
+			return;
+		}
+		const link = this.link!;
+		this.clearLinkTimers(link);
+		link.phase = 'live';
+		this.socketStatus = SOCKET_STATUS.READY;
+
+		const waiters = this.promiseArray;
+		this.promiseArray = [];
+		waiters.forEach(({ res }) => {
+			this.logger.debug('Notifying connection successful');
+			res();
+		});
+	}
+
+	/**
+	 * The single terminal transition for a link that WAS live. The generation and
+	 * phase guard is what stops a dead socket's late onclose recording CLOSED
+	 * against a healthy connection, clearing its keep-alive interval and
+	 * orphaning the server's subscriptions.
+	 */
+	private loseLink(gen: number, msg: string) {
+		if (!this.isCurrent(gen) || this.link!.phase !== 'live') {
+			this.logger.debug(
+				`Disconnect ignored (${msg}): not the current live link`,
+			);
+
+			return;
+		}
+		this.logger.debug(`Disconnect error: ${msg}`);
+
+		const link = this.link!;
+		this.releaseLink(link);
+		this.link = undefined;
+		this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSED);
+		this.rejectWaiters(new Error('Realtime link lost'));
+	}
+
+	/**
+	 * One signal per failure episode. An episode opens on the first failed
+	 * attempt after the last Connected and closes on the next Connected. While
+	 * the device is offline it is suspended, not cleared: if the fault is still
+	 * there when the network returns, it is the same unbroken episode.
+	 *
+	 * Every attempt dispatches an event, so a host can see attempt evidence, but
+	 * only `report !== 'none'` is meant to reach a user or an error reporter.
+	 */
+	private recordEpisodeFailure(
+		err: unknown,
+		phase: LinkPhase,
+		socketStatus: string,
+	): RealtimeConnectionFailure {
+		const { reason, detail } = classifyRealtimeFailure(err, phase);
+		const now = Date.now();
+
+		if (this.episodeStartedAt === 0) {
+			this.episodeId += 1;
+			this.episodeStartedAt = now;
+			this.consecutiveFailures = 0;
+			this.episodeReportedAt = 0;
+			this.socketsAttemptedInEpisode = 0;
+			this.failureReasons = {};
+		}
+
+		const suspended = this.episodeSuspended;
+		if (!suspended) {
+			this.consecutiveFailures += 1;
+			this.failureReasons[reason] = (this.failureReasons[reason] ?? 0) + 1;
+		}
+
+		const diagnostics: RealtimeDiagnostics = {
+			episodeId: this.episodeId,
+			consecutiveFailures: this.consecutiveFailures,
+			socketsAttempted: this.socketsAttemptedInEpisode,
+			socketStatus,
+			phase,
+			msSinceEpisodeStart: now - this.episodeStartedAt,
+			msSinceLastConnected: this.lastConnectedAt
+				? now - this.lastConnectedAt
+				: null,
+			subscriptions: this.subscriptionObserverMap.size,
+			reasons: { ...this.failureReasons },
+		};
+
+		const failure = new RealtimeConnectionFailure(reason, detail, diagnostics);
+		// One line that names the failure. Every attempt leaves this trace, even
+		// the ones the episode rules do not report.
+		this.logger.debug(failure.message);
+
+		let report: 'none' | 'open' | 'repeat' = 'none';
+		if (!suspended) {
+			if (
+				this.episodeReportedAt === 0 &&
+				this.consecutiveFailures >= REALTIME_REPORT_AFTER_FAILURES
+			) {
+				report = 'open';
+			} else if (
+				this.episodeReportedAt !== 0 &&
+				now - this.episodeReportedAt >= REALTIME_REPEAT_REPORT_MS
+			) {
+				report = 'repeat';
+			}
+		}
+		if (report !== 'none') {
+			this.episodeReportedAt = now;
+		}
+
+		dispatchApiEvent({
+			event: REALTIME_CONNECTION_FAILURE,
+			data: {
+				provider: this,
+				providerName: this.providerName,
+				report,
+				reason,
+				isAuthFailure: failure.isAuthFailure,
+				message: failure.message,
+				diagnostics,
+			},
+			message: failure.message,
+		});
+
+		return failure;
+	}
+
+	/**
+	 * Realtime works end to end: the episode is over. Idempotent, so the many
+	 * acks of one connection give one recovery event.
+	 */
+	private onRealtimeWorking() {
+		const reported = this.episodeReportedAt !== 0;
+		const { episodeId } = this;
+		const attempts = this.consecutiveFailures;
+		const durationMs = this.episodeStartedAt
+			? Date.now() - this.episodeStartedAt
+			: 0;
+
+		this.lastConnectedAt = Date.now();
+		this.episodeStartedAt = 0;
+		this.consecutiveFailures = 0;
+		this.episodeReportedAt = 0;
+		this.socketsAttemptedInEpisode = 0;
+		this.failureReasons = {};
+		this.lastFailure = undefined;
+
+		if (reported) {
+			dispatchApiEvent({
+				event: REALTIME_RECOVERED,
+				data: {
+					provider: this,
+					providerName: this.providerName,
+					episodeId,
+					attempts,
+					durationMs,
+				},
+				message: 'Realtime connection recovered',
+			});
+		}
+	}
 }

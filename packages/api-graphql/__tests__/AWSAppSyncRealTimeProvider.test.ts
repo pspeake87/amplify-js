@@ -458,11 +458,13 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						CS.Connecting,
 					]);
 
-					await fakeWebSocketInterface?.readyForUse;
+					// The failed attempt's socket was discarded, handlers and all, so
+					// these events must reach the replay's own socket.
+					await fakeWebSocketInterface?.waitForNewSocket();
 
 					await fakeWebSocketInterface?.triggerOpen();
 
-					fakeWebSocketInterface?.handShakeMessage({
+					await fakeWebSocketInterface?.handShakeMessage({
 						connectionTimeoutMs: 100,
 					});
 
@@ -519,12 +521,15 @@ describe('AWSAppSyncRealTimeProvider', () => {
 					});
 
 					// When the socket is closed during handshake
-					// Watching for raised exception to be caught and logged
+					// Watching for raised exception to be caught and logged. The
+					// rejection now says what happened instead of dumping the event.
 					expect(loggerSpy).toHaveBeenCalledWith(
 						'DEBUG',
 						expect.stringContaining('error on bound '),
 						expect.objectContaining({
-							message: expect.stringMatching('{"isTrusted":false}'),
+							message: expect.stringMatching(
+								'Connection closed during the handshake',
+							),
 						}),
 					);
 				});
@@ -877,15 +882,20 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						CS.ConnectionDisrupted,
 					]);
 
+					// The reconnect opens a new attempt. Its socket exists one turn
+					// after the Connecting label, and the lost socket was discarded
+					// with its handlers, so the events below must go to the new one.
+					await fakeWebSocketInterface?.waitUntilConnectionStateIn([
+						CS.Connecting,
+					]);
+					await fakeWebSocketInterface?.waitForNewSocket();
+
 					await fakeWebSocketInterface?.triggerOpen();
 
 					await fakeWebSocketInterface?.handShakeMessage({
 						connectionTimeoutMs: 100,
 					});
-					await fakeWebSocketInterface?.waitUntilConnectionStateIn([
-						CS.Connecting,
-					]);
-					fakeWebSocketInterface?.startAckMessage();
+					await fakeWebSocketInterface?.startAckMessage();
 					await fakeWebSocketInterface.keepAlive();
 
 					// Wait until the socket is automatically reconnected
@@ -946,12 +956,16 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						CS.ConnectionDisrupted,
 					]);
 
-					await fakeWebSocketInterface?.triggerOpen();
-					await fakeWebSocketInterface?.handShakeMessage();
-
+					// The reconnect opens a new attempt. Its socket exists one turn
+					// after the Connecting label, and the lost socket was discarded
+					// with its handlers, so the events below must go to the new one.
 					await fakeWebSocketInterface?.waitUntilConnectionStateIn([
 						CS.Connecting,
 					]);
+					await fakeWebSocketInterface?.waitForNewSocket();
+
+					await fakeWebSocketInterface?.triggerOpen();
+					await fakeWebSocketInterface?.handShakeMessage();
 
 					await fakeWebSocketInterface?.startAckMessage();
 
@@ -1115,11 +1129,13 @@ describe('AWSAppSyncRealTimeProvider', () => {
 					});
 				});
 
-				test('subscription start failure must not replay start with the same id on the still-open socket', async () => {
-					// Same invariant as above, via the other trigger: a throw while
-					// preparing one subscription's start message (e.g. custom-auth token
-					// resolution failing) lands in startSubscription's catch and must not
-					// mark the shared, healthy socket as disrupted without closing it.
+				test('one subscription start failure leaves the shared live link alone', async () => {
+					// Same invariant as above, via the other trigger, and the behaviour
+					// changed: a throw while preparing ONE subscription's start message
+					// now marks only that subscription failed. It used to disrupt the
+					// shared socket, which punished every other subscription on it for a
+					// fault that was not the connection's. A start for A is still sent
+					// exactly once, now because nothing closed the link at all.
 					const socketLog: { event: string; id?: string }[] = [];
 					const fakeSocket = fakeWebSocketInterface.webSocket;
 					const originalSend = fakeSocket.send.bind(fakeSocket);
@@ -1169,20 +1185,20 @@ describe('AWSAppSyncRealTimeProvider', () => {
 					});
 					observerB.subscribe({ error: () => {} });
 
-					await fakeWebSocketInterface?.waitUntilConnectionStateIn([
-						CS.ConnectionDisrupted,
-					]);
-
-					// Give the ReconnectionMonitor (RECONNECT_DELAY is 100ms in this
-					// suite) time to fire the resubscription replay
+					// Long enough for a reconnect round to have happened if the link had
+					// been disrupted (RECONNECT_DELAY is 100ms in this suite)
 					await delay(500);
 
-					const firstClose = socketLog.findIndex(f => f.event === 'close');
-					const startsForABeforeClose = socketLog
-						.map((f, i) => ({ ...f, i }))
-						.filter(f => f.event === MESSAGE_TYPES.GQL_START && f.id === idA)
-						.filter(f => firstClose === -1 || f.i < firstClose);
-					expect(startsForABeforeClose).toHaveLength(1);
+					expect(
+						fakeWebSocketInterface?.hubConnectionListener
+							?.currentConnectionState,
+					).toBe(CS.Connected);
+					expect(socketLog.filter(f => f.event === 'close')).toHaveLength(0);
+					expect(
+						socketLog.filter(
+							f => f.event === MESSAGE_TYPES.GQL_START && f.id === idA,
+						),
+					).toHaveLength(1);
 				});
 
 				test('connection init timeout met', async () => {
@@ -1209,13 +1225,15 @@ describe('AWSAppSyncRealTimeProvider', () => {
 								?.currentConnectionState,
 						).toBe(CS.Connecting);
 
-						// Watching for raised exception to be caught and logged
+						// Watching for raised exception to be caught and logged. The
+						// handshake deadline is now the link's own phase timer, so the
+						// message it would raise is PhaseDeadlineError's.
 						expect(loggerSpy).not.toHaveBeenCalledWith(
 							'DEBUG',
 							expect.stringContaining('error on bound '),
 							expect.objectContaining({
 								message: expect.stringMatching(
-									'Connection timeout: ack from AWSAppSyncRealTime was not received after',
+									'Realtime handshake did not finish in',
 								),
 							}),
 						);
@@ -1239,9 +1257,13 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						// Wait no less than 20 ms
 						await delay(20);
 
-						// Wait until the socket is automatically disconnected
+						// A missed handshake ack is a failed attempt we intend to retry,
+						// so it publishes ConnectionDisrupted. It used to record
+						// CONNECTION_FAILED, which published Disconnected, halted the
+						// reconnect monitor and disabled network monitoring — one missed
+						// ack ended realtime for the life of the page.
 						await fakeWebSocketInterface?.waitUntilConnectionStateIn([
-							CS.Disconnected,
+							CS.ConnectionDisrupted,
 						]);
 
 						// Watching for raised exception to be caught and logged
@@ -1250,7 +1272,7 @@ describe('AWSAppSyncRealTimeProvider', () => {
 							expect.stringContaining('error on bound '),
 							expect.objectContaining({
 								message: expect.stringMatching(
-									'Connection timeout: ack from AWSAppSyncRealTime was not received after',
+									'Realtime handshake did not finish in 20 ms',
 								),
 							}),
 						);
@@ -1444,9 +1466,12 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						// TODO Find a better way to give the catch stack time to resolve
 						await delay(10);
 
+						// The failure is now classified: the same missing token reads as
+						// an auth dead end, in the wording DataStore's own error map
+						// matches (/Connection failed.+Unauthorized/).
 						expect(loggerSpy).toHaveBeenCalledWith(
 							'DEBUG',
-							'AppSync Realtime subscription init error: Error: No auth token specified',
+							'AppSync Realtime subscription init error: RealtimeConnectionFailure: Connection failed: UnauthorizedException: no auth token was available',
 						);
 					});
 				});

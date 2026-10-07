@@ -7,6 +7,7 @@ import {
 	ConnectionState,
 	CONNECTION_STATE_CHANGE as PUBSUB_CONNECTION_STATE_CHANGE,
 	CONTROL_MSG as PUBSUB_CONTROL_MSG,
+	REALTIME_CONNECTION_FAILURE,
 } from '@aws-amplify/api-graphql';
 
 import { ModelInstanceCreator } from '../datastore/datastore';
@@ -284,6 +285,11 @@ export class SyncEngine {
 										},
 									});
 
+									// One listener per engine. This branch runs on every return to
+									// online, and the listener was only ever removed at stop(), so
+									// each network blip added one more: the catch-up sync and the
+									// realtime failure report then ran once per blip so far.
+									this.stopDisruptionListener?.();
 									this.stopDisruptionListener = this.startDisruptionListener();
 									// #region GraphQL Subscriptions
 									const [ctlSubsObservable, dataSubsObservable] =
@@ -1289,10 +1295,24 @@ export class SyncEngine {
 	 */
 	private startDisruptionListener() {
 		return Hub.listen('api', (data: any) => {
-			if (
-				data.source === 'PubSub' &&
-				data.payload.event === PUBSUB_CONNECTION_STATE_CHANGE
-			) {
+			if (data.source !== 'PubSub') {
+				return;
+			}
+
+			if (data.payload.event === REALTIME_CONNECTION_FAILURE) {
+				// DataStore subscribes through the AppSync realtime provider only.
+				// The Events provider dispatches the same event on this channel.
+				if (data.payload.data?.providerName !== 'AWSAppSyncRealTimeProvider') {
+					return;
+				}
+				// `reportRealtimeFailure` handles its own failure, so nothing
+				// waits for it. A Hub listener cannot be async.
+				this.reportRealtimeFailure(data.payload.data);
+
+				return;
+			}
+
+			if (data.payload.event === PUBSUB_CONNECTION_STATE_CHANGE) {
 				const connectionState = data.payload.data
 					.connectionState as ConnectionState;
 
@@ -1312,6 +1332,40 @@ export class SyncEngine {
 				}
 			}
 		});
+	}
+
+	/**
+	 * One error handler call per realtime failure episode. The provider decides
+	 * when an episode is worth reporting (`report`), so this method never counts
+	 * and never rate limits. It is the single place where a connection-level
+	 * failure becomes a host-visible error: reporting it per model instead gave
+	 * about 45 calls for one connection blip.
+	 */
+	private async reportRealtimeFailure(payload: any) {
+		const { report, reason, isAuthFailure, message, diagnostics } =
+			payload ?? {};
+		if (!report || report === 'none') {
+			return;
+		}
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression
+			await this.errorHandler({
+				message,
+				errorType: isAuthFailure ? 'Unauthorized' : 'Transient',
+				errorInfo: JSON.stringify({ reason, report, ...diagnostics }),
+				recoverySuggestion: isAuthFailure
+					? 'Reload the page so the session is re-derived from durable state.'
+					: 'Live updates are off. Saved changes are kept and sent when the connection returns.',
+				model: undefined,
+				localModel: null!,
+				remoteModel: null!,
+				process: ProcessName.subscribe,
+				operation: 'Connect',
+				cause: undefined,
+			});
+		} catch (e) {
+			logger.error('realtime error handler failed with:', e);
+		}
 	}
 
 	/*

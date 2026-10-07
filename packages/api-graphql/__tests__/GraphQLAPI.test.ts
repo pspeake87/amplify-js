@@ -1577,7 +1577,9 @@ describe('API test', () => {
 		const spyon_appsync_realtime = jest
 			.spyOn(
 				AWSAppSyncRealTimeProvider.prototype as any,
-				'_establishRetryableConnection',
+				// The retry wrapper is gone. The connect step itself takes the url
+				// first, so the assertion below is unchanged.
+				'_establishConnection',
 			)
 			.mockImplementation(
 				jest.fn(() => {

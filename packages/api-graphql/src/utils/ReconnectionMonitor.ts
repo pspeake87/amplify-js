@@ -28,6 +28,19 @@ export class ReconnectionMonitor {
 	}
 
 	/**
+	 * Stop alerting an observer. rxjs makes an unsubscribed Subscriber a no-op,
+	 * so a leftover entry was harmless — but the array was never pruned, so it
+	 * grew by one entry per subscription per DataStore restart and every replay
+	 * walked the whole history.
+	 */
+	removeObserver(reconnectObserver: Observer<void>) {
+		const index = this.reconnectObservers.indexOf(reconnectObserver);
+		if (index !== -1) {
+			this.reconnectObservers.splice(index, 1);
+		}
+	}
+
+	/**
 	 * Given a reconnect event, start the appropriate behavior
 	 */
 	record(event: ReconnectEvent) {
@@ -67,10 +80,12 @@ export class ReconnectionMonitor {
 		this.reconnectObservers.forEach(reconnectObserver => {
 			reconnectObserver.complete?.();
 		});
+		this.reconnectObservers = [];
 	}
 
 	private _triggerReconnect() {
-		this.reconnectObservers.forEach(reconnectObserver => {
+		// A copy: an observer may remove itself while it is being notified.
+		this.reconnectObservers.slice().forEach(reconnectObserver => {
 			reconnectObserver.next?.();
 		});
 	}

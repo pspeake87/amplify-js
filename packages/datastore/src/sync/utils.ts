@@ -42,6 +42,7 @@ import {
 } from '../util';
 
 import {
+	RequestTimeoutError,
 	TOKEN_REQUEST_TIMEOUT_MS,
 	TransientRequestError,
 	withTimeLimit,
@@ -929,6 +930,25 @@ export function getClientSideAuthError(error) {
 	return clientSideError || null;
 }
 
+/**
+ * The app's `functionAuthProvider` answered with no token.
+ *
+ * An empty token can never reach AppSync: the realtime URL builder adds the
+ * Authorization header only for a truthy token, and api-graphql's own
+ * `authHeaders` then throws this same message locally. There is nothing to gain
+ * by passing it on. The realtime layer classifies this failure by NAME and
+ * reports it once as an auth dead end.
+ *
+ * Still a `TransientRequestError`: it is not an answer about any record, so a
+ * write stays in the outbox and a sync page is requested again.
+ */
+export class MissingAuthTokenError extends TransientRequestError {
+	constructor() {
+		super(GraphQLAuthError.NO_AUTH_TOKEN);
+		this.name = 'MissingAuthTokenError';
+	}
+}
+
 export async function getTokenForCustomAuth(
 	authMode: GraphQLAuthMode,
 	amplifyConfig: Record<string, any> = {},
@@ -947,17 +967,20 @@ export async function getTokenForCustomAuth(
 					TOKEN_REQUEST_TIMEOUT_MS,
 				));
 			} catch (error) {
-				// The token is not an answer about any record: the caller must
-				// try again later.
+				// The 30 s limit and a provider throw are different facts, and the
+				// realtime classifier needs to tell them apart. Wrapping both lost
+				// that distinction. Either way the token is not an answer about any
+				// record, so the caller must try again later.
+				if (error instanceof RequestTimeoutError) {
+					throw error;
+				}
 				throw new TransientRequestError(
 					`Error retrieving token from \`functionAuthProvider\`: ${error}`,
 				);
 			}
 
 			if (!token) {
-				// api-graphql would throw `NoAuthorizationHeader`; fail early
-				// with the same meaning
-				throw new TransientRequestError('No auth token specified');
+				throw new MissingAuthTokenError();
 			}
 
 			return token;
