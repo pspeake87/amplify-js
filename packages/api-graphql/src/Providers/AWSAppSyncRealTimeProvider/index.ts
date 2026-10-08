@@ -41,7 +41,13 @@ interface DataPayload {
 	type: string;
 }
 
-const PROVIDER_NAME = 'AWSAppSyncRealTimeProvider';
+/**
+ * The `providerName` this provider puts on every `api` Hub event. A host that
+ * filters the channel imports it, so a rename fails to compile instead of
+ * silencing the host's detector.
+ */
+export const AWS_APPSYNC_REALTIME_PROVIDER_NAME = 'AWSAppSyncRealTimeProvider';
+const PROVIDER_NAME = AWS_APPSYNC_REALTIME_PROVIDER_NAME;
 const WS_PROTOCOL_NAME = 'graphql-ws';
 const CONNECT_URI = '/connect';
 

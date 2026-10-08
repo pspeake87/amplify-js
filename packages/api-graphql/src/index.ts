@@ -13,4 +13,5 @@ export {
 	REALTIME_CONNECTION_FAILURE,
 	REALTIME_RECOVERED,
 } from './Providers/constants';
+export { AWS_APPSYNC_REALTIME_PROVIDER_NAME } from './Providers/AWSAppSyncRealTimeProvider';
 export * from './internals/events/types';

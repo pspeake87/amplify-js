@@ -34,7 +34,7 @@ import {
 	REALTIME_CONNECTION_FAILURE,
 	REALTIME_RECOVERED,
 	REALTIME_REPEAT_REPORT_MS,
-	REALTIME_REPORT_AFTER_FAILURES,
+	REALTIME_REPORT_AFTER_MS,
 	SOCKET_CLOSE_TIMEOUT,
 	SOCKET_STATUS,
 	START_ACK_TIMEOUT,
@@ -72,6 +72,27 @@ import {
 const dispatchApiEvent = (payload: HubPayload) => {
 	Hub.dispatch('api', payload, 'PubSub', AMPLIFY_SYMBOL);
 };
+
+/**
+ * A wait on the host that is not part of an attempt (an attempt's waits go
+ * through withPhaseDeadline). The library must not trust the host to answer.
+ */
+const withDeadline = <T>(work: Promise<T>, ms: number): Promise<T> =>
+	new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			reject(new PhaseDeadlineError('headers', ms));
+		}, ms);
+		work.then(
+			value => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			err => {
+				clearTimeout(timer);
+				reject(err);
+			},
+		);
+	});
 
 export interface ObserverQuery {
 	observer: PubSubContentObserver;
@@ -112,6 +133,8 @@ interface Link {
 	libraryConfigHeaders?: Record<string, string>;
 	budgetTimer?: ReturnType<typeof setTimeout>;
 	phaseTimer?: ReturnType<typeof setTimeout>;
+	/** A deliberate close that waits for the socket's buffer to drain. */
+	closeTimer?: ReturnType<typeof setTimeout>;
 	budgetReached: Promise<void>;
 	/**
 	 * Rejects the step this attempt is waiting on. Releasing a link disarms its
@@ -133,7 +156,6 @@ export abstract class AWSWebSocketProvider {
 	private keepAliveTimestamp: number = Date.now();
 	private keepAliveHeartbeatIntervalId?: ReturnType<typeof setInterval>;
 
-	private connectionState: ConnectionState | undefined;
 	private readonly connectionStateMonitor = new ConnectionStateMonitor();
 	private readonly reconnectionMonitor = new ReconnectionMonitor();
 	private connectionStateMonitorSubscription: SubscriptionLike;
@@ -518,7 +540,6 @@ export abstract class AWSWebSocketProvider {
 					},
 					message: `Connection state is ${connectionState}`,
 				});
-				this.connectionState = connectionState;
 
 				// A failure while the device is offline is not a dead end, and the
 				// reconnect monitor is halted for it anyway. No DOM: the
@@ -606,10 +627,16 @@ export abstract class AWSWebSocketProvider {
 			startedGen: undefined,
 		});
 
+		// Two kinds of start. A start queued behind an attempt is signed with that
+		// attempt's credentials: one token read for the whole replay round, read
+		// seconds ago. A start on a link that is ALREADY live resolves its own:
+		// the link's credentials were read when it connected, and a link can live
+		// for a day while the token it carried has expired.
+		const linkWasLive = this.link?.phase === 'live';
+
 		let link: Link;
 		try {
-			// Single flight: the token is read once for this replay round, not once
-			// per subscription, and the whole round is one attempt, one failure.
+			// Single flight: the whole round is one attempt, one failure.
 			link = await this.ensureLink(options);
 		} catch (err) {
 			this._failStartSubscription(subscriptionId, observer, err);
@@ -617,15 +644,54 @@ export abstract class AWSWebSocketProvider {
 			return;
 		}
 
+		let serializedSubscriptionMessage: string;
 		try {
-			const serializedSubscriptionMessage =
-				await this._prepareSubscriptionPayload({
-					options,
-					subscriptionId,
-					customUserAgentDetails,
-					additionalCustomHeaders: link.headers ?? {},
-					libraryConfigHeaders: link.libraryConfigHeaders ?? {},
-				});
+			const headers = linkWasLive
+				? await withDeadline(
+						additionalHeadersFromOptions(options),
+						HEADER_RESOLVE_TIMEOUT,
+					)
+				: {
+						additionalCustomHeaders: link.headers ?? {},
+						libraryConfigHeaders: link.libraryConfigHeaders ?? {},
+					};
+			serializedSubscriptionMessage = await this._prepareSubscriptionPayload({
+				options,
+				subscriptionId,
+				customUserAgentDetails,
+				additionalCustomHeaders: headers.additionalCustomHeaders as Record<
+					string,
+					string
+				>,
+				libraryConfigHeaders: headers.libraryConfigHeaders as Record<
+					string,
+					string
+				>,
+			});
+		} catch (err) {
+			if (linkWasLive && this.isCurrent(link.gen)) {
+				// A start on a live link has no replay of its own: left FAILED it
+				// would stay so for the life of the link. Its credentials failed (an
+				// empty token fails here, in the payload), so drop the link and the
+				// attempt machinery owns the retry and the report.
+				this.loseLink(link.gen, CONTROL_MSG.CONNECTION_FAILED);
+			}
+			this._failStartSubscription(subscriptionId, observer, err);
+
+			return;
+		}
+
+		try {
+			if (!this.entry(subscriptionId)) {
+				// Unsubscribed while this start was queued: the teardown gave up its
+				// wait and deleted the entry. A start sent now would be a server-side
+				// subscription that no GQL_STOP ever ends.
+				this.logger.debug(
+					`Start of ${subscriptionId} skipped: unsubscribed while queued`,
+				);
+
+				return;
+			}
 
 			if (!this.isCurrent(link.gen) || link.phase !== 'live' || !link.socket) {
 				// The link died while the payload was built. The next replay covers
@@ -779,51 +845,40 @@ export abstract class AWSWebSocketProvider {
 
 			return;
 		}
-		if (link.phase === 'closing') {
+		if (link.closeTimer) {
+			// A close is already waiting for the socket's buffer.
 			return;
 		}
 
-		const { gen } = link;
-		const previousPhase = link.phase;
-		const wasLive = previousPhase === 'live';
-		link.phase = 'closing';
-		this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSING_CONNECTION);
-
-		const finish = () => {
-			if (!this.isCurrent(gen) || link.phase !== 'closing') {
-				return;
-			}
-			if (this.subscriptionObserverMap.size > 0) {
-				// A subscription arrived while we were closing: keep the link, put it
-				// back in the phase it was interrupted in, and put the published
-				// label back where it was.
-				link.phase = previousPhase;
-				this.connectionStateMonitor.record(
-					CONNECTION_CHANGE.OPENING_CONNECTION,
-				);
-				if (wasLive) {
-					this.connectionStateMonitor.record(
-						CONNECTION_CHANGE.CONNECTION_ESTABLISHED,
-					);
-				}
-
+		const close = () => {
+			link.closeTimer = undefined;
+			if (!this.isCurrent(link.gen) || this.subscriptionObserverMap.size > 0) {
+				// The link was lost meanwhile, or a subscription arrived during the
+				// grace period. The link never changed phase or label while it
+				// waited, so there is nothing to undo: that subscription started on
+				// the open socket like any other.
 				return;
 			}
 			this.logger.debug('closing WebSocket...');
+			this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSING_CONNECTION);
 			this.releaseLink(link);
 			this.link = undefined;
 			this.connectionStateMonitor.record(CONNECTION_CHANGE.CLOSED);
 			this.rejectWaiters(new Error('Realtime link closed'));
 		};
 
-		// ONE grace period for a buffered send, then the close happens anyway.
-		// Rescheduling itself while bufferedAmount stayed above zero meant a
-		// teardown could never complete and the label never left
-		// ConnectedPendingDisconnect.
-		if (link.socket && link.socket.bufferedAmount > 0) {
-			setTimeout(finish, SOCKET_CLOSE_TIMEOUT);
+		// ONE grace period for a buffered send on a live socket, then the close
+		// happens anyway. Rescheduling while bufferedAmount stayed above zero
+		// meant a teardown could never complete. An attempt that is not live yet
+		// has nothing buffered worth waiting for and is abandoned at once.
+		if (
+			link.phase === 'live' &&
+			link.socket &&
+			link.socket.bufferedAmount > 0
+		) {
+			link.closeTimer = setTimeout(close, SOCKET_CLOSE_TIMEOUT);
 		} else {
-			finish();
+			close();
 		}
 	}
 
@@ -1064,17 +1119,20 @@ export abstract class AWSWebSocketProvider {
 
 		link.budgetTimer = setTimeout(() => {
 			reachBudget();
-			this.failAttempt(gen, new AttemptBudgetError(CONNECT_ATTEMPT_BUDGET));
+			this.failAttempt(
+				gen,
+				new AttemptBudgetError(CONNECT_ATTEMPT_BUDGET, link.phase),
+			);
 		}, CONNECT_ATTEMPT_BUDGET);
 
 		try {
-			// The backstop settles this chain too, not only the shared state: a
+			// The budget settles this chain too, not only the shared state: a
 			// pending promise cannot be cancelled, so a step that somehow has no
 			// deadline of its own would otherwise hold this caller for ever.
 			await Promise.race([
 				this.runConnect(gen, link, options),
 				link.budgetReached.then((): never => {
-					throw new AttemptBudgetError(CONNECT_ATTEMPT_BUDGET);
+					throw new AttemptBudgetError(CONNECT_ATTEMPT_BUDGET, link.phase);
 				}),
 			]);
 
@@ -1458,6 +1516,10 @@ export abstract class AWSWebSocketProvider {
 			clearTimeout(link.phaseTimer);
 			link.phaseTimer = undefined;
 		}
+		if (link.closeTimer) {
+			clearTimeout(link.closeTimer);
+			link.closeTimer = undefined;
+		}
 	}
 
 	/** The one place that frees an attempt's resources. */
@@ -1589,18 +1651,17 @@ export abstract class AWSWebSocketProvider {
 	): RealtimeConnectionFailure {
 		const { reason, detail } = classifyRealtimeFailure(err, phase);
 		const now = Date.now();
-
-		if (this.episodeStartedAt === 0) {
-			this.episodeId += 1;
-			this.episodeStartedAt = now;
-			this.consecutiveFailures = 0;
-			this.episodeReportedAt = 0;
-			this.socketsAttemptedInEpisode = 0;
-			this.failureReasons = {};
-		}
-
 		const suspended = this.episodeSuspended;
+
 		if (!suspended) {
+			if (this.episodeStartedAt === 0) {
+				// The counters are already at rest: onRealtimeWorking zeroed them
+				// when the last episode closed, and the socket of THIS failed attempt
+				// is already counted. Nothing is reset here. A failure while offline
+				// opens no episode: the first failure with a network does.
+				this.episodeId += 1;
+				this.episodeStartedAt = now;
+			}
 			this.consecutiveFailures += 1;
 			this.failureReasons[reason] = (this.failureReasons[reason] ?? 0) + 1;
 		}
@@ -1611,7 +1672,9 @@ export abstract class AWSWebSocketProvider {
 			socketsAttempted: this.socketsAttemptedInEpisode,
 			socketStatus,
 			phase,
-			msSinceEpisodeStart: now - this.episodeStartedAt,
+			msSinceEpisodeStart: this.episodeStartedAt
+				? now - this.episodeStartedAt
+				: 0,
 			msSinceLastConnected: this.lastConnectedAt
 				? now - this.lastConnectedAt
 				: null,
@@ -1628,7 +1691,7 @@ export abstract class AWSWebSocketProvider {
 		if (!suspended) {
 			if (
 				this.episodeReportedAt === 0 &&
-				this.consecutiveFailures >= REALTIME_REPORT_AFTER_FAILURES
+				now - this.episodeStartedAt >= REALTIME_REPORT_AFTER_MS
 			) {
 				report = 'open';
 			} else if (

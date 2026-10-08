@@ -53,7 +53,25 @@ describe('AWSWebSocketProvider connect attempt', () => {
 		).rejects.toBeDefined();
 	};
 
+	// The wall clock the episode rules read. The timers stay real (they are
+	// tens of milliseconds here), so only the clock the rules compare moves.
+	let now = 0;
+	const advance = (ms: number) => {
+		now += ms;
+	};
+	// The production replay times. This file overrides RECONNECT_DELAY itself,
+	// so the constants cannot be read here.
+	const FIRST_REPLAY_MS = 5000;
+	const REPLAY_INTERVAL_MS = 60000;
+	/** The attempt about 65 s after a first failure: the one that reports. */
+	const failAfterOneInterval = async () => {
+		advance(FIRST_REPLAY_MS + REPLAY_INTERVAL_MS);
+		await failOneAttempt();
+	};
+
 	beforeEach(() => {
+		now = 1_000_000;
+		jest.spyOn(Date, 'now').mockImplementation(() => now);
 		// One connect try per attempt: jitteredBackoff refuses a delay above the
 		// maximum, so the first failure is final.
 		Object.defineProperty(constants, 'MAX_DELAY_MS', { value: 100 });
@@ -146,7 +164,9 @@ describe('AWSWebSocketProvider connect attempt', () => {
 		await failOneAttempt();
 
 		expect(lastFailure().reason).toBe('connect-deadline');
-		expect(lastFailure().diagnostics.socketsAttempted).toBe(0);
+		// The socket of the attempt that opens the episode counts: 0 is reserved
+		// for a failure before any socket.
+		expect(lastFailure().diagnostics.socketsAttempted).toBe(1);
 		// The socket is claimed synchronously, so the deadline can really close it.
 		expect(harness.socket.closedWith).toEqual([3001]);
 		expect(harness.socket.handlers).toEqual([null, null, null, null]);
@@ -244,36 +264,55 @@ describe('AWSWebSocketProvider connect attempt', () => {
 		);
 	});
 
-	test('the second consecutive failure reports open; the first reports none', async () => {
+	test('an episode reports once it is older than the report age; a 5 s replay does not', async () => {
+		// A first connect: the start itself fails, then the reconnect monitor
+		// replays RECONNECT_DELAY later. A count of two failures reported here,
+		// 5 s into a page load, on one transient token read.
 		await failOneAttempt();
-		expect(failures()).toHaveLength(1);
 		expect(failures()[0].data.report).toBe('none');
 		expect(failures()[0].data.diagnostics.consecutiveFailures).toBe(1);
 
+		advance(FIRST_REPLAY_MS);
 		await failOneAttempt();
-		expect(failures()).toHaveLength(2);
-		expect(failures()[1].data.report).toBe('open');
+		expect(failures()[1].data.report).toBe('none');
 		expect(failures()[1].data.diagnostics.consecutiveFailures).toBe(2);
-		expect(failures()[1].data.diagnostics.episodeId).toBe(1);
+
+		// The replay one interval later is the one that reports.
+		advance(REPLAY_INTERVAL_MS);
+		await failOneAttempt();
+		expect(failures()[2].data.report).toBe('open');
+		expect(failures()[2].data.diagnostics.consecutiveFailures).toBe(3);
+		expect(failures()[2].data.diagnostics.episodeId).toBe(1);
+		expect(failures()[2].data.diagnostics.msSinceEpisodeStart).toBe(
+			FIRST_REPLAY_MS + REPLAY_INTERVAL_MS,
+		);
+	});
+
+	test('the socket of every attempt in the episode is counted, the first included', async () => {
+		await failOneAttempt();
+		await failAfterOneInterval();
+
+		// Two attempts, two sockets. Resetting the count when the episode opened
+		// lost the first one, so a socket-level episode read as a token failure.
+		expect(failures()[1].data.report).toBe('open');
+		expect(failures()[1].data.diagnostics.socketsAttempted).toBe(2);
+		expect(harness.sockets).toHaveLength(2);
 	});
 
 	test('a repeat report arrives once per repeat interval while the episode continues', async () => {
-		let now = 1_000_000;
-		jest.spyOn(Date, 'now').mockImplementation(() => now);
-
 		await failOneAttempt();
-		await failOneAttempt();
+		await failAfterOneInterval();
 		expect(failures()[1].data.report).toBe('open');
 
-		now += 30 * 60 * 1000;
+		advance(30 * 60 * 1000);
 		await failOneAttempt();
 		expect(failures()[2].data.report).toBe('none');
 
-		now += 31 * 60 * 1000;
+		advance(31 * 60 * 1000);
 		await failOneAttempt();
 		expect(failures()[3].data.report).toBe('repeat');
 
-		now += 1000;
+		advance(1000);
 		await failOneAttempt();
 		expect(failures()[4].data.report).toBe('none');
 	});
@@ -290,12 +329,16 @@ describe('AWSWebSocketProvider connect attempt', () => {
 		failures().forEach(failure => {
 			expect(failure.data.report).toBe('none');
 			expect(failure.data.diagnostics.consecutiveFailures).toBe(0);
+			// No episode opens while offline, so the first failure with a network
+			// starts the clock, not a failure from before the outage.
+			expect(failure.data.diagnostics.episodeId).toBe(0);
+			expect(failure.data.diagnostics.msSinceEpisodeStart).toBe(0);
 		});
 	});
 
 	test('a working connection clears the episode and dispatches realtimeRecovered once', async () => {
 		await failOneAttempt();
-		await failOneAttempt();
+		await failAfterOneInterval();
 		expect(failures()[1].data.report).toBe('open');
 
 		const { id } = await connectOneSubscription(harness);
@@ -364,17 +407,67 @@ describe('AWSWebSocketProvider connect attempt', () => {
 		expect(observer.error).not.toHaveBeenCalled();
 	});
 
-	test('the failure message matches DataStore subscriptionErrorMap.Unauthorized', async () => {
+	test('a client-side failure names the client-side fact, and the host reads isAuthFailure', async () => {
 		harness.provider
 			.subscribe(lambdaOptions({ additionalHeaders: { Authorization: '' } }))
 			.subscribe({ error: () => {} });
 		await settle();
 
-		// The host contract: anything that classifies a realtime failure by
-		// message instead of by errorType must get the same answer.
-		expect(/Connection failed.+Unauthorized/.test(lastFailure().message)).toBe(
-			true,
+		// The token never left the browser, so the message must not read like a
+		// service exception: that false lead cost a root-cause investigation.
+		expect(lastFailure().message).toBe(
+			'Connection failed: the app produced no auth token',
 		);
+		expect(lastFailure().message).not.toMatch(/Exception/);
 		expect(lastFailure().isAuthFailure).toBe(true);
+	});
+
+	test('the attempt budget is larger than one pass through every phase', () => {
+		// A tie would file a real phase deadline as attempt-budget.
+		expect(constants.CONNECT_ATTEMPT_BUDGET).toBeGreaterThan(
+			constants.HEADER_RESOLVE_TIMEOUT +
+				constants.CONNECT_SOCKET_TIMEOUT +
+				constants.CONNECTION_INIT_TIMEOUT,
+		);
+	});
+
+	test('a start on a live link resolves its own credentials', async () => {
+		let token = 'token-at-connect';
+		const options = lambdaOptions({
+			additionalHeaders: async () => ({ Authorization: token }),
+		});
+		await connectOneSubscription(harness);
+		const socket = harness.socket;
+		expect(harness.link().phase).toBe('live');
+
+		// The token the host would hand out now is not the one the link opened
+		// with. The old per-start read did this; the single flight must not
+		// undo it for a start that finds the link already live.
+		token = 'token-now';
+		harness.provider.subscribe(options).subscribe({ error: () => {} });
+		await settle();
+
+		expect(socket.startFrames).toHaveLength(2);
+		expect(socket.startFrames[1].payload.extensions.authorization).toEqual(
+			expect.objectContaining({ Authorization: 'token-now' }),
+		);
+	});
+
+	test('a start on a live link whose credentials fail drops the link', async () => {
+		await connectOneSubscription(harness);
+		const socket = harness.socket;
+		const error = jest.fn();
+
+		harness.provider
+			.subscribe(lambdaOptions({ additionalHeaders: { Authorization: '' } }))
+			.subscribe({ error });
+		await settle();
+
+		// Left FAILED on a live link the start would have no replay at all. The
+		// link is dropped instead and the attempt machinery owns the retry.
+		expect(socket.closedWith).toEqual([3001]);
+		expect(harness.link()).toBeUndefined();
+		expect(api.states()[api.states().length - 1]).toBe(CS.ConnectionDisrupted);
+		expect(error).not.toHaveBeenCalled();
 	});
 });

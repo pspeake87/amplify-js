@@ -180,40 +180,84 @@ describe('AWSWebSocketProvider teardown', () => {
 			harness.map().clear();
 
 			(harness.provider as any)._closeSocketIfRequired();
-			expect(api.states()[api.states().length - 1]).toBe(
-				CS.ConnectedPendingDisconnect,
-			);
+			// The link stays live while the buffer drains: nothing has closed yet.
+			expect(api.states()[api.states().length - 1]).toBe(CS.Connected);
+			expect(harness.link().phase).toBe('live');
 
 			await delay(40);
 
 			// One grace period, then the close happens anyway. Rescheduling for ever
 			// while bufferedAmount stayed above zero meant the teardown never
-			// completed and the label never left ConnectedPendingDisconnect.
+			// completed.
 			expect(api.states()[api.states().length - 1]).toBe(CS.Disconnected);
 			expect(harness.link()).toBeUndefined();
 			expect(socket.closedWith).toEqual([3001]);
 		});
 	});
 
-	test('_closeSocketIfRequired abandons the close when a subscription arrives', async () => {
+	test('a subscription that arrives during the close grace starts on the open socket', async () => {
 		await replaceConstant('SOCKET_CLOSE_TIMEOUT', 20, async () => {
-			const { id } = await connectOneSubscription(harness);
-			const entry = harness.map().get(id);
-			harness.socket.bufferedAmount = 1;
-			harness.map().clear();
-
+			const { subscription } = await connectOneSubscription(harness);
+			const socket = harness.socket;
+			socket.bufferedAmount = 1;
+			subscription.unsubscribe();
+			await delay(2);
 			(harness.provider as any)._closeSocketIfRequired();
-			expect(api.states()[api.states().length - 1]).toBe(
-				CS.ConnectedPendingDisconnect,
-			);
+			expect(harness.map().size).toBe(0);
 
-			// A new subscription arrives while the close is waiting.
-			harness.map().set(id, entry);
+			// The real path, not a map write: a 'closing' phase parked this start
+			// in promiseArray, and the abandoned close never released it, so the
+			// subscription stayed PENDING on a link the app believed healthy.
+			harness.provider.subscribe(lambdaOptions()).subscribe({ error: () => {} });
+			await settle();
+
+			expect(harness.promiseArray()).toHaveLength(0);
+			expect(socket.startFrames).toHaveLength(2);
+
 			await delay(40);
 
-			expect(api.states()[api.states().length - 1]).toBe(CS.Connected);
+			// The grace ended with a subscription present: nothing closed.
 			expect(harness.link().phase).toBe('live');
-			expect(harness.socket.closedWith).toEqual([]);
+			expect(socket.closedWith).toEqual([]);
+			expect(api.states()[api.states().length - 1]).toBe(CS.Connected);
+		});
+	});
+
+	test('a start queued behind an attempt is not sent once its unsubscribe gave up', async () => {
+		await replaceConstant('SUBSCRIPTION_STOP_WAIT_TIMEOUT', 20, async () => {
+			// Two subscriptions queued behind one attempt whose header stage is
+			// slow: the host answers only when the test says so.
+			let answerHeaders!: (headers: Record<string, string>) => void;
+			const options = lambdaOptions({
+				additionalHeaders: () =>
+					new Promise<Record<string, string>>(resolve => {
+						answerHeaders = resolve;
+					}),
+			});
+			const a = harness.provider.subscribe(options).subscribe({ error: () => {} });
+			harness.provider.subscribe(options).subscribe({ error: () => {} });
+			await settle();
+			expect(harness.map().size).toBe(2);
+
+			// A's teardown runs out of patience while the attempt still runs, and
+			// deletes A's entry. B keeps the attempt alive.
+			a.unsubscribe();
+			await delay(40);
+			expect(stopSkips()[0].data.reason).toBe('wait-timeout');
+			expect(harness.map().size).toBe(1);
+
+			// The attempt goes live and releases every queued start.
+			answerHeaders({ Authorization: 'a-token' });
+			await settle();
+			harness.socket.open();
+			await settle();
+			harness.socket.connectionAck();
+			await settle();
+
+			// Only B's start is sent. A start for A would be a server-side
+			// subscription that no GQL_STOP ever ends.
+			const [bId] = [...harness.map().keys()];
+			expect(harness.socket.startFrames.map(frame => frame.id)).toEqual([bId]);
 		});
 	});
 

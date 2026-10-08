@@ -1129,7 +1129,7 @@ describe('AWSAppSyncRealTimeProvider', () => {
 					});
 				});
 
-				test('one subscription start failure leaves the shared live link alone', async () => {
+				test('a start whose credentials fail on the live link drops the link for a fresh round', async () => {
 					// Same invariant as above, via the other trigger, and the behaviour
 					// changed: a throw while preparing ONE subscription's start message
 					// now marks only that subscription failed. It used to disrupt the
@@ -1176,29 +1176,27 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						CS.Connected,
 					]);
 
-					// Subscription B fails before its start message can be sent
+					// Subscription B starts on the live link and cannot get its
+					// credentials. Left FAILED it would have no replay for the life of
+					// the link, so the link is dropped and the reconnect round owns the
+					// retry — for A too. The caller is not told: this is not a
+					// configuration error.
+					const errorB = jest.fn();
 					jest
 						.spyOn(provider as any, '_prepareSubscriptionPayload')
 						.mockRejectedValueOnce(new Error('No auth token specified'));
 					const observerB = provider.subscribe({
 						appSyncGraphqlEndpoint: 'ws://localhost:8080',
 					});
-					observerB.subscribe({ error: () => {} });
-
-					// Long enough for a reconnect round to have happened if the link had
-					// been disrupted (RECONNECT_DELAY is 100ms in this suite)
-					await delay(500);
+					observerB.subscribe({ error: errorB });
+					await delay(10);
 
 					expect(
 						fakeWebSocketInterface?.hubConnectionListener
 							?.currentConnectionState,
-					).toBe(CS.Connected);
-					expect(socketLog.filter(f => f.event === 'close')).toHaveLength(0);
-					expect(
-						socketLog.filter(
-							f => f.event === MESSAGE_TYPES.GQL_START && f.id === idA,
-						),
-					).toHaveLength(1);
+					).not.toBe(CS.Connected);
+					expect(socketLog.filter(f => f.event === 'close')).toHaveLength(1);
+					expect(errorB).not.toHaveBeenCalled();
 				});
 
 				test('connection init timeout met', async () => {
@@ -1466,12 +1464,12 @@ describe('AWSAppSyncRealTimeProvider', () => {
 						// TODO Find a better way to give the catch stack time to resolve
 						await delay(10);
 
-						// The failure is now classified: the same missing token reads as
-						// an auth dead end, in the wording DataStore's own error map
-						// matches (/Connection failed.+Unauthorized/).
+						// The failure is classified as an auth dead end (reason
+						// no-auth-token) and its message names the client-side fact: the
+						// token never reached the service.
 						expect(loggerSpy).toHaveBeenCalledWith(
 							'DEBUG',
-							'AppSync Realtime subscription init error: RealtimeConnectionFailure: Connection failed: UnauthorizedException: no auth token was available',
+							'AppSync Realtime subscription init error: RealtimeConnectionFailure: Connection failed: the app produced no auth token',
 						);
 					});
 				});

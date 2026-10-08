@@ -68,6 +68,32 @@ describe('ReconnectionMonitor', () => {
 		expect(observers()).toHaveLength(0);
 	});
 
+	test('close() completes every observer although each one removes itself on complete', () => {
+		// The provider's rxjs teardown removes the observer when it completes,
+		// so close() walks an array that shrinks under it. A walk over the live
+		// array completed every second observer only.
+		const completed: number[] = [];
+		const selfRemoving = (index: number): Observer<void> => {
+			const observer: Observer<void> = observerOf(
+				jest.fn(),
+				jest.fn(() => {
+					completed.push(index);
+					monitor.removeObserver(observer);
+				}),
+			);
+
+			return observer;
+		};
+		[0, 1, 2, 3, 4, 5].forEach(index => {
+			monitor.addObserver(selfRemoving(index));
+		});
+
+		monitor.close();
+
+		expect(completed).toEqual([0, 1, 2, 3, 4, 5]);
+		expect(observers()).toHaveLength(0);
+	});
+
 	test('a reconnect round keeps the two handles external diagnostics read', async () => {
 		Object.defineProperty(constants, 'RECONNECT_DELAY', { value: 5 });
 		const next = jest.fn();

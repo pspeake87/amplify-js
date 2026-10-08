@@ -173,15 +173,20 @@ export const CONNECT_SOCKET_TIMEOUT = 15000;
 export const HEADER_RESOLVE_TIMEOUT = 30000;
 
 /**
- * Backstop for one whole connect attempt. It should never fire: every phase has
- * its own deadline and a phase deadline is non-retryable, so the worst
- * legitimate chain is about 45 s (the credentials, then one 15 s handshake
- * deadline). One RECONNECT_INTERVAL is the right size for a backstop: if an
- * attempt has not settled by the time its replacement is due, it is stuck, not
- * slow. Settling is done by failAttempt, not by the retry loop's onTerminate —
- * `retry()` cannot interrupt a hung functionToRetry.
+ * Budget for one whole connect attempt. Two jobs. It bounds the retry loop
+ * around the socket stage, whose fast failures (a refused socket) retry with
+ * backoff and have no other end. And it is the backstop for a phase that
+ * somehow has no deadline. It is derived from the phase deadlines plus a
+ * margin, so one slow but legitimate pass through every phase can never tie
+ * with it: a tie would file a real token-timeout or connect-deadline as
+ * attempt-budget. Settling is done by failAttempt, not by the retry loop's
+ * onTerminate — `retry()` cannot interrupt a hung functionToRetry.
  */
-export const CONNECT_ATTEMPT_BUDGET = RECONNECT_INTERVAL;
+export const CONNECT_ATTEMPT_BUDGET =
+	HEADER_RESOLVE_TIMEOUT +
+	CONNECT_SOCKET_TIMEOUT +
+	CONNECTION_INIT_TIMEOUT +
+	15000;
 
 /**
  * A deliberate close must not wait on the socket it is tearing down. A clean
@@ -191,20 +196,24 @@ export const SOCKET_CLOSE_TIMEOUT = 5000;
 
 /**
  * An unsubscribe waits for a GQL_START_ACK only while a link can still carry
- * this subscription's start. The ack is itself bounded at START_ACK_TIMEOUT, so
- * the wait can never usefully be longer.
+ * this subscription's start. A start queued behind a slow attempt can be sent
+ * later than this, so when the wait gives up the entry is deleted and the start
+ * checks for its entry before it sends: a subscription whose unsubscribe ran
+ * out of patience is never started on the server.
  */
 export const SUBSCRIPTION_STOP_WAIT_TIMEOUT = START_ACK_TIMEOUT;
 
 /**
- * Consecutive failed attempts before an episode is reported. Attempts land
- * about 5 s and 65 s after a link is lost (RECONNECT_DELAY then
- * RECONNECT_INTERVAL), so the report is about 65 s in. That is deliberate: a
- * host's token read can have a short failure window and a success cache, so a
- * transient read failure recovers well inside one interval and can never put a
- * blocking message in front of a working session. One rule, every reason.
+ * How old a failure episode must be before a failed attempt reports it. A
+ * host's token read can have a short failure window, so an episode younger than
+ * this is a transient and can never put a blocking message in front of a
+ * working session. Attempts land about 5 s and 65 s after the first failure
+ * (RECONNECT_DELAY, then RECONNECT_INTERVAL) whether the episode opened at a
+ * lost live link or at a first connect, so in practice the report is the
+ * attempt about 65 s in. A count of attempts cannot say this: on a first
+ * connect the second attempt is the 5 s one. One rule, every reason.
  */
-export const REALTIME_REPORT_AFTER_FAILURES = 2;
+export const REALTIME_REPORT_AFTER_MS = 30000;
 
 /**
  * While an episode continues, repeat the report this often. A tab can stay dead

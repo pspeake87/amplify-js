@@ -77,7 +77,9 @@ export class ReconnectionMonitor {
 	 * Complete all reconnect observers
 	 */
 	close() {
-		this.reconnectObservers.forEach(reconnectObserver => {
+		// A copy: complete() runs the teardown that removes the observer, and a
+		// forEach over the live array skips the element after every removal.
+		this.reconnectObservers.slice().forEach(reconnectObserver => {
 			reconnectObserver.complete?.();
 		});
 		this.reconnectObservers = [];
