@@ -10,6 +10,22 @@ export const NON_RETRYABLE_ERROR_TYPES = [
 	'UnauthorizedException',
 ];
 
+/**
+ * A GQL_START the service refused for a reason no replay can fix: the query
+ * or the schema is wrong, or the operation is disabled. Everything else the
+ * service answers a start with (an expired or rejected credential, the
+ * 200-subscription cap of one connection, a rate limit, anything unknown) is
+ * retryable on a fresh link with fresh credentials. An auth refusal is
+ * retryable HERE, unlike at the handshake: the link can live for a day while
+ * the token it carried has expired, and the next link reads a new one.
+ */
+export const NON_RETRYABLE_START_ERROR_TYPES = [
+	'BadRequestException',
+	'ValidationError',
+	'UnknownOperationException',
+	'OperationDisabled',
+];
+
 export const CONNECTION_STATE_CHANGE = 'ConnectionStateChange';
 
 export enum MESSAGE_TYPES {

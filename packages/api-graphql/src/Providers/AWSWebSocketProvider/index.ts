@@ -31,6 +31,7 @@ import {
 	NEVER_CONNECTED_MESSAGE,
 	NON_RETRYABLE_CODES,
 	NON_RETRYABLE_ERROR_TYPES,
+	NON_RETRYABLE_START_ERROR_TYPES,
 	REALTIME_CONNECTION_FAILURE,
 	REALTIME_RECOVERED,
 	REALTIME_REPEAT_REPORT_MS,
@@ -72,6 +73,26 @@ import {
 const dispatchApiEvent = (payload: HubPayload) => {
 	Hub.dispatch('api', payload, 'PubSub', AMPLIFY_SYMBOL);
 };
+
+const AUTH_ERROR_TYPES = [
+	'UnauthorizedException',
+	'Unauthorized',
+	'NotAuthorizedException',
+];
+
+/**
+ * A refused GQL_START that no replay can fix. Classified by the service's
+ * own fields; an error with no type at all is retryable (the service gave no
+ * reason to stop).
+ */
+const isNonRetryableStartError = (error: {
+	errorType?: string;
+	errorCode?: number;
+	message?: string;
+}): boolean =>
+	NON_RETRYABLE_START_ERROR_TYPES.includes(error.errorType ?? '') ||
+	error.errorCode === 400 ||
+	/validation error/i.test(error.message ?? '');
 
 /**
  * A wait on the host that is not part of an attempt (an attempt's waits go
@@ -158,6 +179,16 @@ export abstract class AWSWebSocketProvider {
 
 	private readonly connectionStateMonitor = new ConnectionStateMonitor();
 	private readonly reconnectionMonitor = new ReconnectionMonitor();
+
+	/**
+	 * Every subscription teardown in progress. rxjs runs an unsubscribe
+	 * synchronously and cannot await it; the teardown itself (wait for the
+	 * server's ack, send GQL_STOP, drop the entry) is asynchronous. A host that
+	 * ends a round and starts another (DataStore's sync engine) awaits
+	 * `settleTeardowns()` in between, so the two rounds never overlap on the
+	 * server, where both count against the 200-subscription cap.
+	 */
+	private readonly teardowns = new Set<Promise<void>>();
 	private connectionStateMonitorSubscription: SubscriptionLike;
 	private readonly wsProtocolName: string;
 	private readonly wsConnectUri: string;
@@ -316,9 +347,30 @@ export abstract class AWSWebSocketProvider {
 			startSubscription();
 
 			return async () => {
-				await this._cleanupSubscription(subscriptionId, reconnectSubscription);
+				const teardown = this._cleanupSubscription(
+					subscriptionId,
+					reconnectSubscription,
+				);
+				this.teardowns.add(teardown);
+				try {
+					await teardown;
+				} finally {
+					this.teardowns.delete(teardown);
+				}
 			};
 		});
+	}
+
+	/**
+	 * Resolves when every teardown in progress has ended: its GQL_STOP was
+	 * sent, or it gave up (no link, or the ack wait ran out). Bounded by the
+	 * unsubscribe wait of one subscription (SUBSCRIPTION_STOP_WAIT_TIMEOUT);
+	 * resolves at once when nothing is being torn down.
+	 */
+	async settleTeardowns(): Promise<void> {
+		while (this.teardowns.size > 0) {
+			await Promise.allSettled([...this.teardowns]);
+		}
 	}
 
 	protected async connect(
@@ -991,72 +1043,116 @@ export abstract class AWSWebSocketProvider {
 			type === MESSAGE_TYPES.GQL_ERROR ||
 			type === MESSAGE_TYPES.EVENT_SUBSCRIBE_ERROR
 		) {
-			if (observer) {
-				this.updateEntry(id, {
-					subscriptionState: SUBSCRIPTION_STATUS.FAILED,
-				});
+			if (!observer) {
+				return;
+			}
+			const { subscriptionState, startedGen } = this.entry(id)!;
 
-				let errorMessage = JSON.stringify(payload ?? data);
-				let isAuthError = false;
+			this.updateEntry(id, {
+				subscriptionState: SUBSCRIPTION_STATUS.FAILED,
+				startAckTimeoutId: undefined,
+			});
+			if (startAckTimeoutId) clearTimeout(startAckTimeoutId);
 
-				const AUTH_ERROR_TYPES = [
-					'UnauthorizedException',
-					'Unauthorized',
-					'NotAuthorizedException',
-				];
+			let errorMessage = JSON.stringify(payload ?? data);
+			let error: { errorType?: string; errorCode?: number; message?: string } =
+				{};
 
-				if (type === MESSAGE_TYPES.EVENT_SUBSCRIBE_ERROR) {
-					const { errors } = JSON.parse(String(message.data));
-					if (Array.isArray(errors) && errors.length > 0) {
-						const error = errors[0];
-						errorMessage = `${error.errorType}: ${error.message}`;
-						isAuthError =
-							AUTH_ERROR_TYPES.includes(error.errorType) ||
-							error.message?.includes('Token expired');
-					}
-				} else if (
-					type === MESSAGE_TYPES.GQL_ERROR &&
-					payload &&
-					typeof payload === 'object'
-				) {
-					const { errors } = payload as Record<string, unknown>;
-					if (Array.isArray(errors) && errors.length > 0) {
-						const error = errors[0] as Record<string, string>;
-						isAuthError =
-							AUTH_ERROR_TYPES.includes(error.errorType) ||
-							error.message?.includes('Token expired');
-					}
+			if (type === MESSAGE_TYPES.EVENT_SUBSCRIBE_ERROR) {
+				const { errors } = JSON.parse(String(message.data));
+				if (Array.isArray(errors) && errors.length > 0) {
+					[error] = errors;
+					errorMessage = `${error.errorType}: ${error.message}`;
 				}
-
-				this.logger.debug(`${CONTROL_MSG.CONNECTION_FAILED}: ${errorMessage}`);
-
-				// On auth errors, lose the link so the stack reconnects with fresh
-				// credentials. loseLink closes the socket itself, so the recovery no
-				// longer depends on the socket's own onclose arriving.
-				if (isAuthError && this.link?.phase === 'live') {
-					this.logger.warn(
-						'Subscription failed due to auth error, closing WebSocket to trigger reconnection with fresh tokens',
-					);
-					this.loseLink(this.link.gen, CONTROL_MSG.CONNECTION_FAILED);
-				}
-
-				observer.error({
-					errors: [
-						{
-							...new GraphQLError(
-								`${CONTROL_MSG.CONNECTION_FAILED}: ${errorMessage}`,
-							),
-						},
-					],
-				});
-
-				if (startAckTimeoutId) clearTimeout(startAckTimeoutId);
-
-				if (typeof subscriptionFailedCallback === 'function') {
-					subscriptionFailedCallback();
+			} else if (
+				type === MESSAGE_TYPES.GQL_ERROR &&
+				payload &&
+				typeof payload === 'object'
+			) {
+				// AppSync sends `errors` as a list; the cap error has been seen as
+				// one object. Read either.
+				const { errors } = payload as Record<string, unknown>;
+				const first = Array.isArray(errors) ? errors[0] : errors;
+				if (first && typeof first === 'object') {
+					error = first as typeof error;
 				}
 			}
+			const isAuthError =
+				AUTH_ERROR_TYPES.includes(error.errorType ?? '') ||
+				!!error.message?.includes('Token expired');
+
+			this.logger.debug(`${CONTROL_MSG.CONNECTION_FAILED}: ${errorMessage}`);
+
+			// A start this live link sent and the service refused. Retryable
+			// (an expired credential, the 200-subscription cap, a limit, anything
+			// unknown): the entry is kept, the link is lost, and the next link
+			// replays every entry with credentials read for that link. Before,
+			// the refusal errored the observable, DataStore dropped that
+			// model-operation for the life of the engine, and the tab had no
+			// realtime for it until a reload (JAVASCRIPT-NEXTJS-50 → -51).
+			const refusedStart =
+				subscriptionState === SUBSCRIPTION_STATUS.PENDING &&
+				this.link?.phase === 'live' &&
+				startedGen === this.link.gen;
+			if (refusedStart && !isNonRetryableStartError(error)) {
+				const refusal = Object.assign(
+					new Error(`${CONTROL_MSG.CONNECTION_FAILED}: ${errorMessage}`),
+					{ errorType: error.errorType, errorCode: error.errorCode },
+				);
+				// Settle a concurrent unsubscribe: the server never registered it,
+				// so there is nothing to stop.
+				if (typeof subscriptionFailedCallback === 'function') {
+					subscriptionFailedCallback(refusal);
+				}
+				this.refuseLink(this.link!.gen, refusal);
+
+				return;
+			}
+
+			// Non-retryable, or a running subscription the service ended: this
+			// model-operation is over. On an auth error, lose the link so the
+			// replay of the others reconnects with fresh credentials.
+			if (isAuthError && this.link?.phase === 'live') {
+				this.logger.warn(
+					'Subscription failed due to auth error, closing WebSocket to trigger reconnection with fresh tokens',
+				);
+				this.loseLink(this.link.gen, CONTROL_MSG.CONNECTION_FAILED);
+			}
+
+			observer.error({
+				errors: [
+					{
+						...new GraphQLError(
+							`${CONTROL_MSG.CONNECTION_FAILED}: ${errorMessage}`,
+						),
+					},
+				],
+			});
+
+			if (typeof subscriptionFailedCallback === 'function') {
+				subscriptionFailedCallback();
+			}
 		}
+	}
+
+	/**
+	 * The live link lost because the service refused a start on it. One
+	 * episode failure per link loss: the other refusals of the round never
+	 * arrive (a closing socket delivers no message), and a late one finds no
+	 * live link. The reason reaches the episode record, so an auth refusal
+	 * reports as an auth failure (the host raises its overlay from that) and
+	 * the cap reports as `start-refused`.
+	 */
+	private refuseLink(gen: number, refusal: Error) {
+		if (!this.isCurrent(gen) || this.link!.phase !== 'live') {
+			return;
+		}
+		this.recordEpisodeFailure(
+			refusal,
+			'live',
+			SOCKET_STATUS[this.socketStatus],
+		);
+		this.loseLink(gen, CONTROL_MSG.CONNECTION_FAILED);
 	}
 
 	/**

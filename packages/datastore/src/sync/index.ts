@@ -4,9 +4,9 @@ import { BackgroundProcessManager } from '@aws-amplify/core/internals/utils';
 import { ConsoleLogger, Hub } from '@aws-amplify/core';
 import { Observable, SubscriptionLike, filter, of } from 'rxjs';
 import {
+	AWS_APPSYNC_REALTIME_PROVIDER_NAME,
 	ConnectionState,
 	CONNECTION_STATE_CHANGE as PUBSUB_CONNECTION_STATE_CHANGE,
-	CONTROL_MSG as PUBSUB_CONTROL_MSG,
 	REALTIME_CONNECTION_FAILURE,
 } from '@aws-amplify/api-graphql';
 
@@ -136,6 +136,26 @@ export class SyncEngine {
 
 	private stopDisruptionListener: () => void;
 	private connectionDisrupted = false;
+
+	/**
+	 * The realtime round is started once per engine: the first time the
+	 * engine goes online after `start()`. A later return to online runs the
+	 * sync queries and the mutation processor again, never a new round. The
+	 * AppSync realtime provider owns the subscriptions from then on: it keeps
+	 * every one across a socket loss and replays it, with its original id, on
+	 * the next link. (Before, every offline→online transition tore all of
+	 * them down and started 45 new ones on the same live socket; a burst of
+	 * transitions stacked rounds on one connection until AppSync refused the
+	 * 201st, and the tab then had no realtime until a reload.)
+	 */
+	private subscriptionsStarted = false;
+
+	/**
+	 * The control and data subscriptions of the realtime round. They live
+	 * from the first online until `stop()`; the per-online subscriptions
+	 * (sync queries, mutation processor) live in `start()`'s own list.
+	 */
+	private realtimeSubscriptions: SubscriptionLike[] = [];
 
 	/**
 	 * True from the start of `stop()` until the engine is ready to restart.
@@ -268,7 +288,12 @@ export class SyncEngine {
 						signalSenderReady();
 						resolve();
 					};
-					const failedStarting = reject;
+					// A failed start settles the sender barrier too: a save job waits
+					// on `senderReady`, and `stop()`/`clear()` wait for that job.
+					const failedStarting = (reason?: unknown) => {
+						signalSenderReady();
+						reject(reason);
+					};
 
 					this.datastoreConnectivity.status().subscribe(
 						async ({ online }) =>
@@ -292,39 +317,56 @@ export class SyncEngine {
 									this.stopDisruptionListener?.();
 									this.stopDisruptionListener = this.startDisruptionListener();
 									// #region GraphQL Subscriptions
-									const [ctlSubsObservable, dataSubsObservable] =
-										this.subscriptionsProcessor.start();
+									// Once per engine. A later return to online skips this block:
+									// the realtime provider kept every subscription and replays it
+									// on its next link, so a new round here would only stack 45
+									// more starts on the same connection.
+									const firstRound = !this.subscriptionsStarted;
+									let dataSubsObservable:
+										| ReturnType<SubscriptionProcessor['start']>[1]
+										| undefined;
+									if (firstRound) {
+										this.subscriptionsStarted = true;
+										const [ctlSubsObservable, dataSubs] =
+											this.subscriptionsProcessor.start();
+										dataSubsObservable = dataSubs;
 
-									try {
-										await new Promise<void>((_resolve, _reject) => {
-											onTerminate.then(_reject);
-											const ctlSubsSubscription = ctlSubsObservable.subscribe({
-												next: msg => {
-													if (msg === CONTROL_MSG.CONNECTED) {
-														_resolve();
-													}
-												},
-												error: err => {
-													_reject(err);
-													const handleDisconnect = this.disconnectionHandler();
-													handleDisconnect(err);
-												},
+										try {
+											await new Promise<void>((_resolve, _reject) => {
+												onTerminate.then(_reject);
+												const ctlSubsSubscription = ctlSubsObservable.subscribe(
+													{
+														next: msg => {
+															if (msg === CONTROL_MSG.CONNECTED) {
+																_resolve();
+															}
+														},
+														// Only a failure before the round is connected reaches
+														// here (the processor keeps the control observable alive
+														// after that), and it fails the engine start as before.
+														// No synthetic offline/online pulse follows: nothing
+														// rebuilds subscriptions because of connectivity.
+														error: err => {
+															_reject(err);
+														},
+													},
+												);
+
+												this.realtimeSubscriptions.push(ctlSubsSubscription);
 											});
+										} catch (err) {
+											observer.error(err);
+											failedStarting();
 
-											subscriptions.push(ctlSubsSubscription);
+											return;
+										}
+
+										logger.log('Realtime ready');
+
+										observer.next({
+											type: ControlMessage.SYNC_ENGINE_SUBSCRIPTIONS_ESTABLISHED,
 										});
-									} catch (err) {
-										observer.error(err);
-										failedStarting();
-
-										return;
 									}
-
-									logger.log('Realtime ready');
-
-									observer.next({
-										type: ControlMessage.SYNC_ENGINE_SUBSCRIPTIONS_ESTABLISHED,
-									});
 
 									// #endregion
 
@@ -458,36 +500,41 @@ export class SyncEngine {
 									// #endregion
 
 									// #region Merge subscriptions buffer
-									subscriptions.push(
-										dataSubsObservable!.subscribe(
-											([_transformerMutationType, modelDefinition, item]) =>
-												this.runningProcesses.add(async () => {
-													const modelConstructor = this.userModelClasses[
-														modelDefinition.name
-													] as PersistentModelConstructor<any>;
+									// Subscribed after the first sync round, as before, so realtime
+									// messages received during the base sync are buffered and merged
+									// after it; then kept until stop(), like the round itself.
+									if (dataSubsObservable) {
+										this.realtimeSubscriptions.push(
+											dataSubsObservable.subscribe(
+												([_transformerMutationType, modelDefinition, item]) =>
+													this.runningProcesses.add(async () => {
+														const modelConstructor = this.userModelClasses[
+															modelDefinition.name
+														] as PersistentModelConstructor<any>;
 
-													const model = this.modelInstanceCreator(
-														modelConstructor,
-														item,
-													);
+														const model = this.modelInstanceCreator(
+															modelConstructor,
+															item,
+														);
 
-													await this.reportJobFailure(
-														'merge of a realtime message',
-														modelDefinition.name,
-														item,
-														() =>
-															this.storage.runExclusive(async storage => {
-																await this.modelMerger.merge(
-																	storage,
-																	model,
-																	modelDefinition,
-																);
-																this.noteMergedVersion(modelDefinition, item);
-															}),
-													);
-												}, 'subscription dataSubsObservable event'),
-										),
-									);
+														await this.reportJobFailure(
+															'merge of a realtime message',
+															modelDefinition.name,
+															item,
+															() =>
+																this.storage.runExclusive(async storage => {
+																	await this.modelMerger.merge(
+																		storage,
+																		model,
+																		modelDefinition,
+																	);
+																	this.noteMergedVersion(modelDefinition, item);
+																}),
+														);
+													}, 'subscription dataSubsObservable event'),
+											),
+										);
+									}
 									// #endregion
 
 									signalSenderReady();
@@ -501,6 +548,9 @@ export class SyncEngine {
 										},
 									});
 
+									// The sync queries and the mutation processor stop while the
+									// device is offline. The realtime round is not in this list: it
+									// lives until stop(), and the provider handles the socket.
 									subscriptions.forEach(sub => {
 										sub.unsubscribe();
 									});
@@ -999,18 +1049,6 @@ export class SyncEngine {
 		});
 	}
 
-	private disconnectionHandler(): (msg: string) => void {
-		return (msg: string) => {
-			// This implementation is tied to AWSAppSyncRealTimeProvider 'Connection closed', 'Timeout disconnect' msg
-			if (
-				PUBSUB_CONTROL_MSG.CONNECTION_CLOSED === msg ||
-				PUBSUB_CONTROL_MSG.TIMEOUT_DISCONNECT === msg
-			) {
-				this.datastoreConnectivity.socketDisconnected();
-			}
-		};
-	}
-
 	public unsubscribeConnectivity() {
 		this.datastoreConnectivity.unsubscribe();
 	}
@@ -1042,6 +1080,16 @@ export class SyncEngine {
 		 */
 
 		await this.mutationsProcessor.stop();
+		/**
+		 * The realtime round ends here, once per engine. The processor's stop
+		 * waits for the provider to finish the teardown of every subscription
+		 * (a GQL_STOP after the server's ack, or a bounded wait), so the next
+		 * engine's round never overlaps this one on the server.
+		 */
+		this.realtimeSubscriptions.forEach(subscription => {
+			subscription.unsubscribe();
+		});
+		this.realtimeSubscriptions = [];
 		await this.subscriptionsProcessor.stop();
 		await this.datastoreConnectivity.stop();
 		await this.syncQueriesProcessor.stop();
@@ -1302,7 +1350,9 @@ export class SyncEngine {
 			if (data.payload.event === REALTIME_CONNECTION_FAILURE) {
 				// DataStore subscribes through the AppSync realtime provider only.
 				// The Events provider dispatches the same event on this channel.
-				if (data.payload.data?.providerName !== 'AWSAppSyncRealTimeProvider') {
+				if (
+					data.payload.data?.providerName !== AWS_APPSYNC_REALTIME_PROVIDER_NAME
+				) {
 					return;
 				}
 				// `reportRealtimeFailure` handles its own failure, so nothing

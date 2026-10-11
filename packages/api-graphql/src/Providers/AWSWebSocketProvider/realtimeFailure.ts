@@ -22,6 +22,7 @@ export type RealtimeFailureReason =
 	| 'handshake-rejected' // connection_error from the service
 	| 'socket-closed' // onclose/onerror during connect or handshake
 	| 'config-error' // BadRequestException, a malformed query
+	| 'start-refused' // a live link: the service refused a GQL_START (cap, limit, unknown)
 	| 'stale-attempt' // superseded by a newer attempt
 	| 'attempt-budget' // the whole attempt used its budget (see constants.ts)
 	| 'unknown';
@@ -145,6 +146,8 @@ export const classifyRealtimeFailure = (
 	}
 	if (
 		errorType === 'UnauthorizedException' ||
+		errorType === 'Unauthorized' ||
+		errorType === 'NotAuthorizedException' ||
 		e.errorCode === 401 ||
 		e.errorCode === 403
 	) {
@@ -163,6 +166,16 @@ export const classifyRealtimeFailure = (
 	}
 	if (name === 'TransientRequestError') {
 		return { reason: 'token-error', detail: message };
+	}
+	if (phase === 'live') {
+		// The link was up and the service refused a start on it. The link is
+		// lost on purpose, so the replay lands on a fresh connection.
+		return {
+			reason: 'start-refused',
+			detail: `the service refused a subscription start (${
+				errorType || message || 'unknown'
+			})`,
+		};
 	}
 	if (errorType) {
 		return { reason: 'handshake-rejected', detail: errorType };

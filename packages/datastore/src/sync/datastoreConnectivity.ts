@@ -4,18 +4,25 @@ import { Observable, Observer, SubscriptionLike } from 'rxjs';
 
 import { ReachabilityMonitor } from './datastoreReachability';
 
-const RECONNECTING_IN = 5000; // 5s this may be configurable in the future
-
 interface ConnectionStatus {
 	// Might add other params in the future
 	online: boolean;
 }
 
+/**
+ * The network as the platform reports it (browser online/offline events,
+ * NetInfo on React Native), and nothing else. The realtime socket is not a
+ * network signal: the AppSync realtime provider owns the socket and replays
+ * every subscription on a new link itself. The synthetic offline-then-online
+ * pulse this class used to emit after a socket error (`socketDisconnected`)
+ * made the sync engine tear down and rebuild all of its subscriptions on a
+ * live connection; a burst of such rebuilds reached the AppSync cap of 200
+ * subscriptions per connection.
+ */
 export default class DataStoreConnectivity {
 	private connectionStatus: ConnectionStatus;
 	private observer!: Observer<ConnectionStatus>;
 	private subscription!: SubscriptionLike;
-	private timeout!: ReturnType<typeof setTimeout>;
 	constructor() {
 		this.connectionStatus = {
 			online: false,
@@ -29,7 +36,6 @@ export default class DataStoreConnectivity {
 
 		return new Observable(observer => {
 			this.observer = observer;
-			// Will be used to forward socket connection changes, enhancing Reachability
 
 			this.subscription = ReachabilityMonitor.subscribe(({ online }) => {
 				this.connectionStatus.online = online;
@@ -40,7 +46,6 @@ export default class DataStoreConnectivity {
 			});
 
 			return () => {
-				clearTimeout(this.timeout);
 				this.unsubscribe();
 			};
 		});
@@ -48,7 +53,6 @@ export default class DataStoreConnectivity {
 
 	unsubscribe() {
 		if (this.subscription) {
-			clearTimeout(this.timeout);
 			this.subscription.unsubscribe();
 		}
 	}
@@ -56,16 +60,5 @@ export default class DataStoreConnectivity {
 	// for consistency with other background processors.
 	async stop() {
 		this.unsubscribe();
-	}
-
-	socketDisconnected() {
-		if (this.observer && typeof this.observer.next === 'function') {
-			this.observer.next({ online: false }); // Notify network issue from the socket
-
-			this.timeout = setTimeout(() => {
-				const observerResult = { ...this.connectionStatus }; // copyOf status
-				this.observer.next(observerResult);
-			}, RECONNECTING_IN); // giving time for socket cleanup and network status stabilization
-		}
 	}
 }

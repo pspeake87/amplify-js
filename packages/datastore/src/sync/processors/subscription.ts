@@ -579,13 +579,17 @@ class SubscriptionProcessor {
 														subscriptionReadyCallback();
 													}
 
-													if (
-														message.includes('"errorType":"Unauthorized"') ||
-														message.includes('"errorType":"OperationDisabled"')
-													) {
-														return;
-													}
-													observer.error(message);
+													// One model-operation is over until the next DataStore
+													// start; the others keep working. The control observable
+													// is never errored for it: an error there runs the
+													// teardown of the whole round, and the round is started
+													// once per engine, so realtime for the session would end
+													// over one operation's error. (Before, the same teardown
+													// ran, and the engine rebuilt the round only on a
+													// connectivity change.)
+													logger.warn(
+														`${operation} subscription for ${modelDefinition.name} stopped until the next DataStore start`,
+													);
 												},
 											}),
 										);
@@ -659,8 +663,29 @@ class SubscriptionProcessor {
 	}
 
 	public async stop() {
+		// close() runs the cleaner: every model-operation is unsubscribed, and
+		// the realtime provider begins the teardown of each (a GQL_STOP once the
+		// server has acked the start, or a bounded wait). That teardown is
+		// asynchronous. Wait for it, so a round started after this stop never
+		// overlaps this round on the server: AppSync counts both against the
+		// 200-subscription cap of one connection.
 		await this.runningProcesses.close();
+		await this.settleRealtimeTeardowns();
 		await this.runningProcesses.open();
+	}
+
+	private async settleRealtimeTeardowns() {
+		const api = this.amplifyContext.InternalAPI as {
+			settleRealtimeTeardowns?(): Promise<void>;
+		};
+		if (typeof api?.settleRealtimeTeardowns !== 'function') {
+			return;
+		}
+		try {
+			await api.settleRealtimeTeardowns();
+		} catch (err) {
+			logger.debug('realtime teardown did not settle cleanly', err);
+		}
 	}
 
 	private passesPredicateValidation(

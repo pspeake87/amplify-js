@@ -61,10 +61,4 @@ export class FakeDataStoreConnectivity {
 	async stop() {
 		this.unsubscribe();
 	}
-
-	socketDisconnected() {
-		if (this.observer && typeof this.observer.next === 'function') {
-			this.observer.next({ online: false }); // Notify network issue from the socket
-		}
-	}
 }

@@ -619,7 +619,7 @@ describe('error handler', () => {
 		});
 	});
 
-	test('error handler once after all retires have failed', done => {
+	test('error handler once after all retires have failed', async () => {
 		window['LOG_LEVEL'] = 'DEBUG';
 		const debugLog = jest.spyOn(console, 'log');
 		const message = PUBSUB_CONTROL_MSG.REALTIME_SUBSCRIPTION_INIT_ERROR;
@@ -633,55 +633,51 @@ describe('error handler', () => {
 			});
 		});
 
+		// A failed model-operation never errors the control observable: that
+		// would tear down the whole round, which is started once per engine.
+		const ctlError = jest.fn();
 		const subscription = subscriptionProcessor.start();
-		subscription[0].subscribe({
-			error: data => {
-				console.log(data);
-				console.log(errorHandler.mock.calls);
+		subscription[0].subscribe({ error: ctlError });
 
-				// call once each for Create, Update, and Delete
-				expect(errorHandler).toHaveBeenCalledTimes(3);
-				['Create', 'Update', 'Delete'].forEach(operation => {
-					expect(errorHandler).toHaveBeenCalledWith(
-						expect.objectContaining({
-							process: 'subscribe',
-							errorType: 'Unknown',
-							message,
-							model: 'Model',
-							operation,
-						}),
-					);
-					// expect logger.debug to be called 6 times for auth mode (2 for each operation)
-					// can't use toHaveBeenCalledTimes because it is called elsewhere unrelated to the test
-					expect(debugLog).toHaveBeenCalledWith(
-						expect.stringMatching(
-							new RegExp(
-								`[DEBUG].*${operation} subscription failed with authMode: apiKey`,
-							),
-						),
-					);
-					expect(debugLog).toHaveBeenCalledWith(
-						expect.stringMatching(
-							new RegExp(
-								`[DEBUG].*${operation} subscription failed with authMode: userPool`,
-							),
-						),
-					);
+		// call once each for Create, Update, and Delete
+		for (let i = 0; i < 50 && errorHandler.mock.calls.length < 3; i += 1) {
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		expect(errorHandler).toHaveBeenCalledTimes(3);
+		expect(ctlError).not.toHaveBeenCalled();
+		['Create', 'Update', 'Delete'].forEach(operation => {
+			expect(errorHandler).toHaveBeenCalledWith(
+				expect.objectContaining({
+					process: 'subscribe',
+					errorType: 'Unknown',
+					message,
+					model: 'Model',
+					operation,
+				}),
+			);
+			// expect logger.debug to be called 6 times for auth mode (2 for each operation)
+			// can't use toHaveBeenCalledTimes because it is called elsewhere unrelated to the test
+			expect(debugLog).toHaveBeenCalledWith(
+				expect.stringMatching(
+					new RegExp(
+						`[DEBUG].*${operation} subscription failed with authMode: apiKey`,
+					),
+				),
+			);
+			expect(debugLog).toHaveBeenCalledWith(
+				expect.stringMatching(
+					new RegExp(
+						`[DEBUG].*${operation} subscription failed with authMode: userPool`,
+					),
+				),
+			);
 
-					expect(mockGraphQL).toHaveBeenCalledWith(
-						expect.anything(),
-						undefined,
-						{
-							category: Category.DataStore,
-							action: DataStoreAction.Subscribe,
-						},
-					);
-				});
-
-				done();
-			},
+			expect(mockGraphQL).toHaveBeenCalledWith(expect.anything(), undefined, {
+				category: Category.DataStore,
+				action: DataStoreAction.Subscribe,
+			});
 		});
-	}, 500);
+	});
 
 	async function instantiateSubscriptionProcessor({
 		errorHandler = () => null,

@@ -360,6 +360,20 @@ export class InternalGraphQLAPIClass {
 		return this._api.cancelREST(request, message);
 	}
 
+	/**
+	 * Resolves when every realtime provider has ended the subscription
+	 * teardowns in progress (each GQL_STOP sent, or given up after its bounded
+	 * wait). DataStore's sync engine awaits this in `stop()`, so a round it
+	 * starts next never overlaps the previous one on the server.
+	 */
+	async settleRealtimeTeardowns(): Promise<void> {
+		await Promise.all(
+			[...this.appSyncRealTime.values()].map(provider =>
+				provider.settleTeardowns(),
+			),
+		);
+	}
+
 	private _graphqlSubscribe(
 		amplify: AmplifyClassV6,
 		{
