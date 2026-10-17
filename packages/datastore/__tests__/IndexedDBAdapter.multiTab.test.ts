@@ -2,6 +2,10 @@ import 'fake-indexeddb/auto';
 import { DataStore as DataStoreType } from '../src/datastore/datastore';
 import { PersistentModelConstructor } from '../src/types';
 import { Model, getDataStore } from './helpers';
+import {
+	STORAGE_BLOCKED_EVENT,
+	STORAGE_RELEASED_EVENT,
+} from '../src/storage/adapter/storageEvents';
 
 // Every tab of a site shares one IndexedDB database. The browser sends each
 // open connection `versionchange` when another tab deletes or upgrades the
@@ -10,7 +14,8 @@ import { Model, getDataStore } from './helpers';
 // neither, so one tab held a delete for ever and every later open, in every
 // tab, queued behind it (ranchr web, 2026-10-16). The adapter now closes and
 // forgets its connection on `versionchange` (Hub `storageReleased`) and
-// reports a blocked delete (Hub `storageBlocked`).
+// reports a blocked delete (Hub `storageBlocked`). The event names are the
+// package's exports, so an app that listens for them compiles against them.
 
 const DB_NAME = 'amplify-datastore';
 
@@ -71,7 +76,7 @@ describe('IndexedDBAdapter between tabs', () => {
 		const { done } = rawDelete();
 		await done;
 
-		expect(events).toContain('storageReleased');
+		expect(events).toContain(STORAGE_RELEASED_EVENT);
 
 		// an operation on the closed connection fails with the browser's own error
 		await expect(DataStore.query(ModelCtor)).rejects.toMatchObject({ name: 'InvalidStateError' });
@@ -96,7 +101,7 @@ describe('IndexedDBAdapter between tabs', () => {
 
 		await new Promise(resolve => setTimeout(resolve, 50));
 		try {
-			expect(events).toContain('storageBlocked');
+			expect(events).toContain(STORAGE_BLOCKED_EVENT);
 			expect(cleared).toBe(false);
 		} finally {
 			blocker.close();
@@ -112,8 +117,8 @@ describe('IndexedDBAdapter between tabs', () => {
 
 		await DataStore.clear();
 
-		expect(events).not.toContain('storageBlocked');
-		expect(events).not.toContain('storageReleased');
+		expect(events).not.toContain(STORAGE_BLOCKED_EVENT);
+		expect(events).not.toContain(STORAGE_RELEASED_EVENT);
 		stop();
 	});
 });

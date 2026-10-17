@@ -27,6 +27,7 @@ import {
 } from '../../util';
 
 import { StorageAdapterBase } from './StorageAdapterBase';
+import { STORAGE_BLOCKED_EVENT, STORAGE_RELEASED_EVENT } from './storageEvents';
 
 const logger = new ConsoleLogger('DataStore');
 
@@ -91,23 +92,7 @@ class IndexedDBAdapter extends StorageAdapterBase {
 	 * @returns IDB Database instance
 	 */
 	protected async initDb(): Promise<idb.IDBPDatabase> {
-		return idb.openDB(this.dbName, DB_VERSION, {
-			// Another tab asked for this database (its DataStore.clear() deletes
-			// it, or an upgrade there): the browser sends every open connection
-			// `versionchange` and waits for all of them to close. Upstream never
-			// listened, so one tab held the delete for ever and every later open
-			// of the database, in every tab, queued behind it (ranchr web,
-			// 2026-10-16). Close at once; the next DataStore start opens it
-			// again (preSetUpChecks). The app hears `storageReleased` and decides
-			// what the page does (ranchr: stop the engine, ask for a refresh).
-			blocking: () => {
-				this.db?.close();
-				this.releasedByOtherTab = true;
-				Hub.dispatch('datastore', {
-					event: 'storageReleased',
-					data: { dbName: this.dbName },
-				});
-			},
+		const connection = await idb.openDB(this.dbName, DB_VERSION, {
 			upgrade: async (db, oldVersion, newVersion, txn) => {
 				// create new database
 				if (oldVersion === 0) {
@@ -204,6 +189,29 @@ class IndexedDBAdapter extends StorageAdapterBase {
 				}
 			},
 		});
+
+		// Another tab asked for this database (its DataStore.clear() deletes
+		// it, or an upgrade there): the browser sends every open connection
+		// `versionchange` and waits for all of them to close. Upstream never
+		// listened, so one tab held the delete for ever and every later open
+		// of the database, in every tab, queued behind it (ranchr web,
+		// 2026-10-16). Close at once; the next DataStore start opens it
+		// again (preSetUpChecks). The app hears `storageReleased` and decides
+		// what the page does (ranchr: stop the engine, ask for a refresh).
+		// The listener closes the connection it belongs to, never the adapter's
+		// current one: idb's `blocking` option is this same listener with no
+		// reference to its connection, so a connection that was replaced would
+		// close the wrong one and keep holding the database.
+		connection.addEventListener('versionchange', () => {
+			connection.close();
+			this.releasedByOtherTab = true;
+			Hub.dispatch('datastore', {
+				event: STORAGE_RELEASED_EVENT,
+				data: { dbName: this.dbName },
+			});
+		});
+
+		return connection;
 	}
 
 	protected async _get<T>(
@@ -236,7 +244,7 @@ class IndexedDBAdapter extends StorageAdapterBase {
 			// and tells the user; the delete completes when that tab lets go.
 			blocked: () => {
 				Hub.dispatch('datastore', {
-					event: 'storageBlocked',
+					event: STORAGE_BLOCKED_EVENT,
 					data: { dbName: this.dbName },
 				});
 			},

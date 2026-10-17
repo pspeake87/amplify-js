@@ -24,6 +24,10 @@ export {
 	ModelSortPredicateCreator,
 } from './predicates';
 export { Adapter as StorageAdapter } from './storage/adapter';
+export {
+	STORAGE_BLOCKED_EVENT,
+	STORAGE_RELEASED_EVENT,
+} from './storage/adapter/storageEvents';
 
 export { NAMESPACES } from './util';
 
