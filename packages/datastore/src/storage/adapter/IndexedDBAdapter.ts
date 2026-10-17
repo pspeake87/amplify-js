@@ -58,11 +58,23 @@ const DB_VERSION = 3;
 class IndexedDBAdapter extends StorageAdapterBase {
 	protected db!: idb.IDBPDatabase;
 	private safariCompatabilityMode = false;
+	// Another tab took the database (`blocking` in initDb). The closed
+	// connection stays in `db` until the next setUp, so an operation in flight
+	// fails with the browser's own InvalidStateError ("The database connection
+	// is closing") and not on a missing object; the next DataStore start
+	// forgets it and opens the database again.
+	private releasedByOtherTab = false;
 
 	// checks are called by StorageAdapterBase class
 	protected async preSetUpChecks() {
 		await this.checkPrivate();
 		await this.setSafariCompatabilityMode();
+
+		if (this.releasedByOtherTab) {
+			this.releasedByOtherTab = false;
+			this.db = undefined!;
+			this.initPromise = undefined!;
+		}
 	}
 
 	protected async preOpCheck() {
@@ -80,6 +92,22 @@ class IndexedDBAdapter extends StorageAdapterBase {
 	 */
 	protected async initDb(): Promise<idb.IDBPDatabase> {
 		return idb.openDB(this.dbName, DB_VERSION, {
+			// Another tab asked for this database (its DataStore.clear() deletes
+			// it, or an upgrade there): the browser sends every open connection
+			// `versionchange` and waits for all of them to close. Upstream never
+			// listened, so one tab held the delete for ever and every later open
+			// of the database, in every tab, queued behind it (ranchr web,
+			// 2026-10-16). Close at once; the next DataStore start opens it
+			// again (preSetUpChecks). The app hears `storageReleased` and decides
+			// what the page does (ranchr: stop the engine, ask for a refresh).
+			blocking: () => {
+				this.db?.close();
+				this.releasedByOtherTab = true;
+				Hub.dispatch('datastore', {
+					event: 'storageReleased',
+					data: { dbName: this.dbName },
+				});
+			},
 			upgrade: async (db, oldVersion, newVersion, txn) => {
 				// create new database
 				if (oldVersion === 0) {
@@ -201,7 +229,18 @@ class IndexedDBAdapter extends StorageAdapterBase {
 		await this.checkPrivate();
 
 		this.db?.close();
-		await idb.deleteDB(this.dbName);
+		await idb.deleteDB(this.dbName, {
+			// A connection in another tab did not close on `versionchange` (an
+			// old bundle without the handshake, a frozen tab): the browser says
+			// so at once, then waits for that tab. The app hears `storageBlocked`
+			// and tells the user; the delete completes when that tab lets go.
+			blocked: () => {
+				Hub.dispatch('datastore', {
+					event: 'storageBlocked',
+					data: { dbName: this.dbName },
+				});
+			},
+		});
 
 		this.db = undefined!;
 		this.initPromise = undefined!;
