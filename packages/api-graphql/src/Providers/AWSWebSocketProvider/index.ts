@@ -189,6 +189,9 @@ export abstract class AWSWebSocketProvider {
 	 * server, where both count against the 200-subscription cap.
 	 */
 	private readonly teardowns = new Set<Promise<void>>();
+
+	/** The state before the current one: a network return is a transition */
+	private lastConnectionState?: ConnectionState;
 	private connectionStateMonitorSubscription: SubscriptionLike;
 	private readonly wsProtocolName: string;
 	private readonly wsConnectUri: string;
@@ -602,9 +605,21 @@ export abstract class AWSWebSocketProvider {
 						ConnectionState.ConnectionDisruptedPendingNetwork ||
 					connectionState === ConnectionState.ConnectedPendingNetwork;
 
-				// Trigger START_RECONNECT when the connection is disrupted
+				// Trigger START_RECONNECT when the connection is disrupted. Ranchr
+				// fork: when the disruption was the device's own network and the
+				// network is back, reconnect now (walk 1, MA8: the fixed delay kept
+				// the realtime link 5 s behind every return to online).
+				const networkReturned =
+					this.lastConnectionState ===
+						ConnectionState.ConnectionDisruptedPendingNetwork &&
+					connectionState === ConnectionState.ConnectionDisrupted;
+				this.lastConnectionState = connectionState;
 				if (connectionState === ConnectionState.ConnectionDisrupted) {
-					this.reconnectionMonitor.record(ReconnectEvent.START_RECONNECT);
+					this.reconnectionMonitor.record(
+						networkReturned
+							? ReconnectEvent.NETWORK_RETURNED
+							: ReconnectEvent.START_RECONNECT,
+					);
 				}
 
 				// Trigger HALT_RECONNECT to halt reconnection attempts when the state is anything other than

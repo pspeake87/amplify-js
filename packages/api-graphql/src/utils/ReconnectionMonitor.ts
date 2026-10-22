@@ -7,6 +7,12 @@ import { RECONNECT_DELAY, RECONNECT_INTERVAL } from '../Providers/constants';
 export enum ReconnectEvent {
 	START_RECONNECT = 'START_RECONNECT',
 	HALT_RECONNECT = 'HALT_RECONNECT',
+	/**
+	 * Ranchr fork: the device's network is back after an outage. The first
+	 * attempt runs now; RECONNECT_DELAY is for a server-side disruption, where
+	 * a pause before the retry is right (kick-the-tires walk 1, MA8).
+	 */
+	NETWORK_RETURNED = 'NETWORK_RETURNED',
 }
 
 /**
@@ -44,6 +50,22 @@ export class ReconnectionMonitor {
 	 * Given a reconnect event, start the appropriate behavior
 	 */
 	record(event: ReconnectEvent) {
+		if (event === ReconnectEvent.NETWORK_RETURNED) {
+			this.record(ReconnectEvent.HALT_RECONNECT);
+			// One turn later, not inside the state change that records it: the
+			// disrupted state must be observable before the new attempt's
+			// Connecting state replaces it.
+			this.reconnectSetTimeoutId = setTimeout(() => {
+				this.reconnectSetTimeoutId = undefined;
+				this._triggerReconnect();
+				this.reconnectIntervalId = setInterval(() => {
+					this._triggerReconnect();
+				}, RECONNECT_INTERVAL);
+			}, 0);
+
+			return;
+		}
+
 		if (event === ReconnectEvent.START_RECONNECT) {
 			// If the reconnection hasn't been started
 			if (

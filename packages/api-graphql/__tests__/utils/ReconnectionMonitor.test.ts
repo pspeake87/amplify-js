@@ -112,4 +112,49 @@ describe('ReconnectionMonitor', () => {
 		expect((monitor as any).reconnectIntervalId).toBeUndefined();
 		expect((monitor as any).reconnectSetTimeoutId).toBeUndefined();
 	});
+
+	// Ranchr fork (kick-the-tires walk 1, MA8): a return of the device's
+	// network reconnects on the next turn; a server-side disruption keeps
+	// RECONNECT_DELAY.
+	describe('a network return', () => {
+		beforeEach(() => jest.useFakeTimers());
+		afterEach(() => jest.useRealTimers());
+
+		test('a disruption reconnects after RECONNECT_DELAY, then every RECONNECT_INTERVAL', () => {
+			const next = jest.fn();
+			monitor.addObserver(observerOf(next));
+			monitor.record(ReconnectEvent.START_RECONNECT);
+			jest.advanceTimersByTime(constants.RECONNECT_DELAY - 1);
+			expect(next).not.toHaveBeenCalled();
+			jest.advanceTimersByTime(1);
+			expect(next).toHaveBeenCalledTimes(1);
+			jest.advanceTimersByTime(constants.RECONNECT_INTERVAL);
+			expect(next).toHaveBeenCalledTimes(2);
+		});
+
+		test('a network return reconnects on the next turn, then every RECONNECT_INTERVAL', () => {
+			const next = jest.fn();
+			monitor.addObserver(observerOf(next));
+			monitor.record(ReconnectEvent.NETWORK_RETURNED);
+			expect(next).not.toHaveBeenCalled();
+			jest.advanceTimersByTime(0);
+			expect(next).toHaveBeenCalledTimes(1);
+			jest.advanceTimersByTime(constants.RECONNECT_INTERVAL - 1);
+			expect(next).toHaveBeenCalledTimes(1);
+			jest.advanceTimersByTime(1);
+			expect(next).toHaveBeenCalledTimes(2);
+		});
+
+		test('a network return replaces a pending delayed attempt; a halt clears everything', () => {
+			const next = jest.fn();
+			monitor.addObserver(observerOf(next));
+			monitor.record(ReconnectEvent.START_RECONNECT);
+			monitor.record(ReconnectEvent.NETWORK_RETURNED);
+			jest.advanceTimersByTime(constants.RECONNECT_DELAY);
+			expect(next).toHaveBeenCalledTimes(1);
+			monitor.record(ReconnectEvent.HALT_RECONNECT);
+			jest.advanceTimersByTime(constants.RECONNECT_INTERVAL * 2);
+			expect(next).toHaveBeenCalledTimes(1);
+		});
+	});
 });
