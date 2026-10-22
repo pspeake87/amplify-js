@@ -11,7 +11,6 @@ import {
 } from '../../types';
 import {
 	DEFAULT_PRIMARY_KEY_VALUE_SEPARATOR,
-	indexNameFromKeys,
 	monotonicUlidFactory,
 } from '../../util';
 
@@ -63,6 +62,12 @@ class AsyncStorageDatabase {
 		const allKeys: string[] = await this.storage.getAllKeys();
 
 		const keysForCollectionEntries: string[] = [];
+		// Ranchr fork: a build before the `save()` fix stored a record under a
+		// new key at every save. Keep the newest copy of each record (ULIDs
+		// sort by creation time) and remove the others, so the index does not
+		// depend on the order of `getAllKeys()`.
+		const newestCopyByRecord = new Map<string, { ulid: string; key: string }>();
+		const staleCopies: string[] = [];
 
 		for (const key of allKeys) {
 			const [dbName, storeName, recordType, ulidOrId, id] = key.split('::');
@@ -70,6 +75,21 @@ class AsyncStorageDatabase {
 			if (dbName === DB_NAME) {
 				if (recordType === DATA) {
 					let ulid: string;
+
+					if (id !== undefined) {
+						const record = `${storeName}::${id}`;
+						const newest = newestCopyByRecord.get(record);
+
+						if (newest === undefined) {
+							newestCopyByRecord.set(record, { ulid: ulidOrId, key });
+						} else if (ulidOrId > newest.ulid) {
+							staleCopies.push(newest.key);
+							newestCopyByRecord.set(record, { ulid: ulidOrId, key });
+						} else {
+							staleCopies.push(key);
+							continue;
+						}
+					}
 
 					if (id === undefined) {
 						// It is an old entry (without ulid). Need to migrate to new key format
@@ -101,6 +121,10 @@ class AsyncStorageDatabase {
 		if (keysForCollectionEntries.length > 0) {
 			await this.storage.multiRemove(keysForCollectionEntries);
 		}
+
+		if (staleCopies.length > 0) {
+			await this.storage.multiRemove(staleCopies);
+		}
 	}
 
 	async save<T extends PersistentModel>(
@@ -109,10 +133,14 @@ class AsyncStorageDatabase {
 		keys: string[],
 		keyValuesPath: string,
 	) {
-		const idxName = indexNameFromKeys(keys);
-
+		// Ranchr fork: the collection index maps the KEY VALUE of a record to
+		// its ULID (see `batchSave`, `delete`, `getAll`). Upstream looked it up
+		// by the index NAME (`indexNameFromKeys(keys)`), which never matched, so
+		// every save of an existing record wrote a new storage key and left the
+		// old one behind. An old copy of a merged outbox entry was then sent
+		// again at the next launch and undid a delete (walk 1, finding MA6).
 		const ulid =
-			this.getCollectionIndex(storeName)?.get(idxName) ||
+			this.getCollectionIndex(storeName)?.get(keyValuesPath) ||
 			this.getMonotonicFactory(storeName)();
 
 		// Retrieve db key for item
