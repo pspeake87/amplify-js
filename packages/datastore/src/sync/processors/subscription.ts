@@ -267,6 +267,12 @@ class SubscriptionProcessor {
 			> = {};
 			let oidcTokenPayload: JwtPayload | undefined;
 			let userCredentials = USER_CREDENTIALS.none;
+			// Ranchr fork: true once this round was torn down. The per-model jobs
+			// below wait on the auth modes and hand off to an un-awaited retry,
+			// so a stop can land before any subscription exists; the cleaner then
+			// has nothing to unsubscribe, and a subscription opened afterwards
+			// would live on the socket until the socket dies (walk 1, MA3).
+			let roundClosed = false;
 			this.runningProcesses.add(async () => {
 				try {
 					// retrieving current AWS Credentials
@@ -300,6 +306,11 @@ class SubscriptionProcessor {
 										modelName: modelDefinition.name,
 										schema: this.schema,
 									});
+
+									if (roundClosed) {
+										// Torn down while the auth modes were read: open nothing
+										return;
+									}
 
 									// subscriptions are created only based on the READ auth mode(s)
 									const readAuthModes = modelAuthModes.READ;
@@ -412,6 +423,13 @@ class SubscriptionProcessor {
 										let subscriptionReadyCallback: (param?: unknown) => void;
 
 										// TODO: consider onTerminate.then(() => API.cancel(...))
+
+										if (roundClosed) {
+											// Torn down before this operation subscribed (a stop during
+											// the start, or a retry that outlived the round): no start
+											// frame goes out for a round that nothing will stop.
+											return;
+										}
 
 										subscriptions[modelDefinition.name][
 											transformerMutationType
@@ -628,6 +646,7 @@ class SubscriptionProcessor {
 			}, 'subscription processor new subscriber');
 
 			return this.runningProcesses.addCleaner(async () => {
+				roundClosed = true;
 				Object.keys(subscriptions).forEach(modelName => {
 					subscriptions[modelName][TransformerMutationType.CREATE].forEach(
 						subscription => {
