@@ -593,6 +593,37 @@ class MutationProcessor {
 						this.unauthorizedReportedFor = undefined;
 						this.headFailures = undefined;
 
+						const answered = (result as any)?.data?.[opName];
+						if (
+							(answered === null || answered === undefined) &&
+							!(result as any)?.errors?.length
+						) {
+							// A 200 with no record and no error: the server did not say what
+							// it did with the change. Upstream dequeued the head and handed a
+							// null record to the merge, which threw before the "processed"
+							// event, so the app waited for ever with no report (kick-the-tires
+							// walk 9, MN1). The change is a refusal to the app: the error
+							// handler gets the local record, and the head leaves the outbox.
+							try {
+								this.errorHandler({
+									recoverySuggestion:
+										'The server answered the mutation with no record and no error. The change is marked failed; the user can send it again.',
+									localModel: variables.input,
+									message: `The server answered ${opName} with no record and no error`,
+									operation: retriedOperation,
+									errorType: 'NullResponse',
+									process: ProcessName.mutate,
+									cause: result as any,
+									remoteModel: null!,
+								});
+							} catch (caughtErr) {
+								logger.warn('Mutation error handler failed with:', caughtErr);
+							}
+
+							// Empty tuple: dequeues the mutation
+							return [] as any;
+						}
+
 						// Use `as any` because TypeScript doesn't seem to like passing tuples
 						// through generic params.
 						return [result, opName, modelDefinition] as any;

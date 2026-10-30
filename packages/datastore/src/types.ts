@@ -1201,6 +1201,7 @@ export type ErrorType =
 	| 'BadRecord'
 	| 'Unauthorized'
 	| 'Transient'
+	| 'NullResponse'
 	| 'Unknown';
 
 export enum ProcessName {

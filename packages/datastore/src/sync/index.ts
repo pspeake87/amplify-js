@@ -460,6 +460,28 @@ export class SyncEngine {
 														modelDefinition.name
 													] as PersistentModelConstructor<any>;
 
+													if (!item) {
+														// No record came back: nothing to merge, but the app
+														// must still hear that the head left the outbox
+														// (walk 9, MN1: `modelInstanceCreator(null)` threw here
+														// and both events below were lost).
+														observer.next({
+															type: ControlMessage.SYNC_ENGINE_OUTBOX_MUTATION_PROCESSED,
+															data: {
+																model: modelConstructor,
+																element: null as any,
+															},
+														});
+														observer.next({
+															type: ControlMessage.SYNC_ENGINE_OUTBOX_STATUS,
+															data: {
+																isEmpty: !hasMore,
+															},
+														});
+
+														return;
+													}
+
 													const model = this.modelInstanceCreator(
 														modelConstructor,
 														item,

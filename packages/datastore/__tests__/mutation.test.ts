@@ -10,7 +10,7 @@ const mockRetry = jest.fn(async (fn, args) => {
 		throw error;
 	}
 });
-const mockRestPost = jest.fn(() => Promise.reject(serverError));
+const mockRestPost = jest.fn((): Promise<any> => Promise.reject(serverError));
 
 import { Amplify } from '@aws-amplify/core';
 
@@ -296,6 +296,26 @@ describe('error handler', () => {
 			errorType: '',
 		};
 		await mutationProcessor.resume();
+		expect((mutationProcessor as any).outbox.peek()).toBeUndefined();
+	});
+
+	test('a 200 with no record and no error marks the write failed and removes it from the outbox (walk 9, MN1)', async () => {
+		mockRestPost.mockImplementationOnce(() =>
+			Promise.resolve({
+				body: { json: async () => ({ data: { createModel: null } }) },
+			}),
+		);
+		await mutationProcessor.resume();
+
+		expect(errorHandler).toHaveBeenCalledWith(
+			expect.objectContaining({
+				operation: 'Create',
+				process: 'mutate',
+				errorType: 'NullResponse',
+				localModel: expect.objectContaining({ field1: 'Some value' }),
+			}),
+		);
+		expect(errorHandler).toHaveBeenCalledTimes(1);
 		expect((mutationProcessor as any).outbox.peek()).toBeUndefined();
 	});
 
