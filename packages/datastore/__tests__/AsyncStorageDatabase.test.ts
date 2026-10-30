@@ -53,3 +53,21 @@ describe('AsyncStorageDatabase keys', () => {
 		expect(keysOf(db)).toEqual([`${prefix}::01J0000000000000000000000D::cow-2`]);
 	});
 });
+
+describe('AsyncStorageDatabase damaged records (Ranchr fork, kick-the-tires walk 8, MM5)', () => {
+	it('getAll skips a record whose stored value is not JSON and returns the others', async () => {
+		const db = new AsyncStorageDatabase();
+		const storage = (db as any).storage.db as Map<string, string>;
+		const prefix = `@AmplifyDatastore::${STORE}::Data`;
+		storage.set(`${prefix}::01J0000000000000000000000A::cow-1`, JSON.stringify({ id: 'cow-1', status: 'Active' }));
+		storage.set(`${prefix}::01J0000000000000000000000B::cow-2`, '{"id":"cow-2","status":"Act');
+		storage.set(`${prefix}::01J0000000000000000000000C::cow-3`, JSON.stringify({ id: 'cow-3', status: 'Sold' }));
+		await db.init();
+
+		const all = await db.getAll<any>(STORE);
+
+		expect(all.map(r => r.id).sort()).toEqual(['cow-1', 'cow-3']);
+		expect(await db.get<any>('cow-2', STORE)).toBeUndefined();
+		expect(await db.get<any>('cow-3', STORE)).toEqual({ id: 'cow-3', status: 'Sold' });
+	});
+});

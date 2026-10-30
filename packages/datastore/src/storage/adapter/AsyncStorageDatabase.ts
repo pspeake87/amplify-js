@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 import { ULID } from 'ulid';
+import { ConsoleLogger, Hub } from '@aws-amplify/core';
 
 import {
 	ModelInstanceMetadata,
@@ -15,6 +16,39 @@ import {
 } from '../../util';
 
 import { createInMemoryStore } from './InMemoryStore';
+
+const logger = new ConsoleLogger('AsyncStorageDatabase');
+
+/**
+ * Ranchr fork: a stored record that is not JSON (a cut write, a damaged
+ * file) must not take its whole model down. Upstream's `JSON.parse` threw out
+ * of `getAll`, so the model's query rejected, the sync engine never left
+ * "Starting", and the app showed an empty list for a ranch of 349 animals
+ * with no report (kick-the-tires walk 8, MM5). The bad record is skipped and
+ * named on the Hub, so the app can report it; the other records load.
+ */
+const parseRecord = <T>(
+	value: string | null | undefined,
+	storeName: string,
+	key: string,
+): T | undefined => {
+	if (!value) {
+		return undefined;
+	}
+	try {
+		const record = JSON.parse(value);
+
+		return record === null ? undefined : record;
+	} catch (error) {
+		logger.warn(`Damaged record skipped in ${storeName}`, { key });
+		Hub.dispatch('datastore', {
+			event: 'storageRecordDamaged',
+			data: { storeName, key },
+		});
+
+		return undefined;
+	}
+};
 
 const DB_NAME = '@AmplifyDatastore';
 const COLLECTION = 'Collection';
@@ -289,9 +323,8 @@ class AsyncStorageDatabase {
 		const ulid = this.getCollectionIndex(storeName)!.get(keyValuePath)!;
 		const itemKey = this.getKeyForItem(storeName, keyValuePath, ulid);
 		const recordAsString = await this.storage.getItem(itemKey);
-		const record = recordAsString && JSON.parse(recordAsString);
 
-		return record;
+		return parseRecord<T>(recordAsString, storeName, itemKey) as T;
 	}
 
 	async getOne(firstOrLast: QueryOne, storeName: string) {
@@ -316,9 +349,7 @@ class AsyncStorageDatabase {
 
 		const itemString = itemKey && (await this.storage.getItem(itemKey));
 
-		const result = itemString ? JSON.parse(itemString) || undefined : undefined;
-
-		return result;
+		return parseRecord(itemString, storeName, itemKey!) as any;
 	}
 
 	/**
@@ -352,9 +383,13 @@ class AsyncStorageDatabase {
 		}
 
 		const storeRecordStrings = await this.storage.multiGet(keysForStore);
-		const records = storeRecordStrings
-			.filter(([, value]) => value)
-			.map(([, value]) => JSON.parse(value));
+		const records: T[] = [];
+		for (const [key, value] of storeRecordStrings) {
+			const record = parseRecord<T>(value, storeName, key);
+			if (record !== undefined) {
+				records.push(record);
+			}
+		}
 
 		return records;
 	}
