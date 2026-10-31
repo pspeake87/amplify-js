@@ -17,7 +17,7 @@ import {
 	InternalSchema,
 	SchemaModel,
 } from '../src/types';
-import { MutationEvent } from '../src/sync/';
+import { MutationEvent, MutationOutcome } from '../src/sync/';
 import { USER, extractPrimaryKeyFieldNames } from '../src/util';
 
 let initSchema: typeof initSchemaType;
@@ -438,6 +438,9 @@ async function instantiateOutbox(): Promise<void> {
 	const MutationEvent = syncClasses[
 		'MutationEvent'
 	] as PersistentModelConstructor<MutationEvent>;
+	const MutationOutcome = syncClasses[
+		'MutationOutcome'
+	] as PersistentModelConstructor<MutationOutcome>;
 
 	await DataStore.start();
 
@@ -452,6 +455,7 @@ async function instantiateOutbox(): Promise<void> {
 	outbox = new MutationEventOutbox(
 		schema,
 		MutationEvent,
+		MutationOutcome,
 		modelInstanceCreator,
 		ownSymbol,
 	);

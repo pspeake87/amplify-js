@@ -31,6 +31,9 @@ export {
 
 export { NAMESPACES } from './util';
 
+// Ranchr fork (-r13): the outbox facts that `DataStore.readOutbox()` returns
+export type { MutationOutcome, MutationOutcomeExit, OutboxRow } from './sync';
+
 export const utils = {
 	USER,
 	traverseModel,

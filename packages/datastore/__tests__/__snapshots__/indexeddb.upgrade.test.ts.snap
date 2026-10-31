@@ -1,6 +1,6 @@
 // Jest Snapshot v1, https://goo.gl/fbAQLP
 
-exports[`DB versions migration with destructive schema change Migration from v1 to v3: v3-destructive-schema 1`] = `
+exports[`DB versions migration with destructive schema change Migration from v1 to v4: v4-destructive-schema 1`] = `
 {
   "data": {
     "data": [
@@ -27,6 +27,11 @@ exports[`DB versions migration with destructive schema change Migration from v1 
         "inbound": false,
         "rows": [],
         "tableName": "sync_MutationEvent",
+      },
+      {
+        "inbound": false,
+        "rows": [],
+        "tableName": "sync_MutationOutcome",
       },
       {
         "inbound": false,
@@ -183,7 +188,7 @@ exports[`DB versions migration with destructive schema change Migration from v1 
       },
     ],
     "databaseName": "amplify-datastore",
-    "databaseVersion": 0.3,
+    "databaseVersion": 0.4,
     "tables": [
       {
         "name": "datastore_Setting",
@@ -197,6 +202,11 @@ exports[`DB versions migration with destructive schema change Migration from v1 
       },
       {
         "name": "sync_MutationEvent",
+        "rowCount": 0,
+        "schema": "++,&[id]",
+      },
+      {
+        "name": "sync_MutationOutcome",
         "rowCount": 0,
         "schema": "++,&[id]",
       },

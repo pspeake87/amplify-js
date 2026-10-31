@@ -11,7 +11,8 @@ import {
 } from '../src/index';
 import { Schema } from '../src/types';
 
-const DB_VERSION = 3;
+// Ranchr fork (-r13): version 4 adds the `sync_MutationOutcome` store
+const DB_VERSION = 4;
 
 let db: idb.IDBPDatabase;
 const { indexedDB } = require('fake-indexeddb');
@@ -100,8 +101,9 @@ describe('DB versions migration with destructive schema change', () => {
 		// Open latest
 		db = await idb.openDB('amplify-datastore', DB_VERSION);
 
-		// 3 internal stores + 1 user store, user_Blog
-		expect(db.objectStoreNames.length).toBe(4);
+		// 4 internal stores (Setting, ModelMetadata, MutationEvent, MutationOutcome) + 1 user store, user_Blog
+		expect(db.objectStoreNames.length).toBe(5);
+		expect([...db.objectStoreNames]).toContain('sync_MutationOutcome');
 
 		for (const storeName of db.objectStoreNames) {
 			expect(db.transaction(storeName).store.indexNames).toContain('byPk');

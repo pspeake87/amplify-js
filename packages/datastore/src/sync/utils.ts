@@ -438,6 +438,7 @@ export function createMutationInstanceFromModelOperation<
 	MutationEventConstructor: PersistentModelConstructor<MutationEvent>,
 	modelInstanceCreator: ModelInstanceCreator,
 	id?: string,
+	saves = 1,
 ): MutationEvent {
 	let operation: TransformerMutationType;
 
@@ -483,6 +484,8 @@ export function createMutationInstanceFromModelOperation<
 		model: model.name,
 		operation: operation!,
 		condition: JSON.stringify(condition),
+		// Ranchr fork (-r13): the saves this row carries (one, until the outbox merges more into it)
+		saves,
 	});
 
 	return mutationEvent;

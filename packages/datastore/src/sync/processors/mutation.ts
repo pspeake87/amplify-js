@@ -36,7 +36,7 @@ import {
 	isTargetNameAssociation,
 } from '../../types';
 import { ID, USER, extractTargetNamesFromSrc } from '../../util';
-import { MutationEventOutbox } from '../outbox';
+import { MutationEventOutbox, OutboxExitInfo } from '../outbox';
 import {
 	MUTATION_REQUEST_TIMEOUT_MS,
 	TransientRequestError,
@@ -298,9 +298,34 @@ class MutationProcessor {
 			const modelConstructor = this.userClasses[
 				model
 			] as PersistentModelConstructor<MutationEvent>;
-			let result: GraphQLResult<Record<string, PersistentModel>> = undefined!;
+
+			// Ranchr fork (-r13): a row of a model this build does not have can
+			// never be sent (`createQueryVariables` has no definition to build
+			// its request from, and the retry treats the TypeError as transient),
+			// so it would hold the queue for ever. It leaves with the outcome
+			// `stranded`, and the app hears about it once.
+			if (
+				modelConstructor === undefined ||
+				this.schema.namespaces[namespaceName].models[model] === undefined
+			) {
+				const strandedId = head.id;
+				await this.storage.runExclusive(async storage => {
+					await this.outbox.dequeue(storage, undefined, undefined, strandedId, {
+						exit: 'stranded',
+					});
+				});
+				Hub.dispatch('datastore', {
+					event: 'outboxRowStranded',
+					data: { model, operation, modelId: head.modelId },
+				});
+				continue;
+			}
+
+			let result: GraphQLResult<Record<string, PersistentModel>> | undefined;
 			let opName: string = undefined!;
 			let modelDefinition: SchemaModel = undefined!;
+			// Ranchr fork (-r13): how the row leaves, when it does not leave as `processed`
+			let exitInfo: OutboxExitInfo | undefined;
 
 			try {
 				const modelAuthModes = await getModelAuthModes({
@@ -353,16 +378,27 @@ class MutationProcessor {
 								}`,
 							);
 							try {
+								// Ranchr fork (-r13): this write is given up and leaves the
+								// outbox, so the report follows the fork's own contract for
+								// a dropped write: `process: 'mutate'` with the local record.
+								// Upstream reported `process: 'sync'` with no record, which
+								// the apps read as a dead session (walk 6, MJ6).
+								let localModel: PersistentModel = null!;
+								try {
+									localModel = JSON.parse(data);
+								} catch {
+									// a row with damaged data: the report names the model only
+								}
 								// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression
 								await this.errorHandler({
 									recoverySuggestion:
 										'Ensure app code is up to date, auth directives exist and are correct on each model, and that server-side data has not been invalidated by a schema change. If the problem persists, search for or create an issue: https://github.com/aws-amplify/amplify-js/issues',
-									localModel: null!,
+									localModel,
 									message: error.message,
 									model: modelConstructor.name,
-									operation: opName,
+									operation,
 									errorType: getMutationErrorType(error),
-									process: ProcessName.sync,
+									process: ProcessName.mutate,
 									remoteModel: null!,
 									cause: error,
 								});
@@ -383,7 +419,7 @@ class MutationProcessor {
 					}
 				};
 
-				[result, opName, modelDefinition] = await authModeRetry();
+				[result, opName, modelDefinition, exitInfo] = await authModeRetry();
 			} catch (error) {
 				if (
 					error instanceof TransientRequestError ||
@@ -392,6 +428,9 @@ class MutationProcessor {
 					// Not a definitive answer: the write stays in the outbox.
 					continue;
 				}
+				// Every auth mode refused the write (the error handler was called
+				// above): the row leaves as `refused`.
+				exitInfo = { exit: 'refused', errorType: getMutationErrorType(error) };
 			}
 
 			// A definitive answer removes the event, also when this loop was
@@ -401,7 +440,13 @@ class MutationProcessor {
 			if (result === undefined) {
 				logger.debug('done retrying');
 				await this.storage.runExclusive(async storage => {
-					await this.outbox.dequeue(storage, undefined, undefined, sentId);
+					await this.outbox.dequeue(
+						storage,
+						undefined,
+						undefined,
+						sentId,
+						exitInfo ?? { exit: 'refused' },
+					);
 				});
 				continue;
 			}
@@ -418,6 +463,7 @@ class MutationProcessor {
 					record,
 					operation,
 					sentId,
+					exitInfo ?? { exit: 'processed' },
 				);
 				hasMore = (await this.outbox.peek(storage)) !== undefined;
 			});
@@ -508,7 +554,12 @@ class MutationProcessor {
 		onStop: Promise<void>,
 		isCurrentLoop: () => boolean,
 	): Promise<
-		[GraphQLResult<Record<string, PersistentModel>>, string, SchemaModel]
+		[
+			GraphQLResult<Record<string, PersistentModel>> | undefined,
+			string,
+			SchemaModel,
+			OutboxExitInfo?,
+		]
 	> {
 		/**
 		 * Waits between two attempts, for ever, unless the loop was
@@ -620,8 +671,13 @@ class MutationProcessor {
 								logger.warn('Mutation error handler failed with:', caughtErr);
 							}
 
-							// Empty tuple: dequeues the mutation
-							return [] as any;
+							// No result: dequeues the mutation, with the outcome `refused`
+							return [
+								undefined,
+								opName,
+								modelDefinition,
+								{ exit: 'refused', errorType: 'NullResponse' },
+							] as any;
 						}
 
 						// Use `as any` because TypeScript doesn't seem to like passing tuples
@@ -751,7 +807,14 @@ class MutationProcessor {
 									{ timeoutMs: MUTATION_REQUEST_TIMEOUT_MS, onStop },
 								)) as GraphQLResult<Record<string, PersistentModel>>;
 
-								return [serverData, builtOpName, modelDefinition];
+								// The change was given up: the row leaves as `discarded`
+								// with the server's version (Ranchr fork, -r13)
+								return [
+									serverData,
+									builtOpName,
+									modelDefinition,
+									{ exit: 'discarded' },
+								];
 							}
 
 							const namespace = this.schema.namespaces[namespaceName];
@@ -767,6 +830,7 @@ class MutationProcessor {
 								retiredMutationEventCtor,
 								this.modelInstanceCreator,
 								retiredMutationEvent.id,
+								retiredMutationEvent.saves ?? 1,
 							);
 
 							await this.storage.save(updatedMutation);
@@ -795,11 +859,29 @@ class MutationProcessor {
 						} catch (caughtErr) {
 							logger.warn('Mutation error handler failed with:', caughtErr);
 						} finally {
-							// Return empty tuple, dequeues the mutation
+							// Dequeues the mutation: `rejected` when the server returned
+							// its copy of the record, `refused` when it returned nothing
+							// (Ranchr fork, -r13)
 							// eslint-disable-next-line no-unsafe-finally
 							return error.data
-								? [{ data: { [opName]: error.data } }, opName, modelDefinition]
-								: [];
+								? [
+										{ data: { [opName]: error.data } },
+										opName,
+										modelDefinition,
+										{
+											exit: 'rejected',
+											errorType: getMutationErrorType(error),
+										},
+									]
+								: [
+										undefined,
+										opName,
+										modelDefinition,
+										{
+											exit: 'refused',
+											errorType: getMutationErrorType(error),
+										},
+									];
 						}
 					}
 					// eslint-disable-next-line no-unmodified-loop-condition

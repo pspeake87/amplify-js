@@ -27,7 +27,14 @@ import {
 import { Adapter } from '../storage/adapter';
 import { ExclusiveStorage as Storage } from '../storage/storage';
 import { ModelRelationship } from '../storage/relationship';
-import { ControlMessage, SyncEngine } from '../sync';
+import {
+	ControlMessage,
+	MutationEvent,
+	MutationOutcome,
+	OutboxRow,
+	SyncEngine,
+} from '../sync';
+import { MutationEventOutbox } from '../sync/outbox';
 import {
 	AmplifyContext,
 	AuthModeStrategy,
@@ -110,6 +117,9 @@ setAutoFreeze(true);
 enablePatches();
 
 const logger = new ConsoleLogger('DataStore');
+
+// Ranchr fork (-r13): marks the writes of `dropOutboxRow` as not the user's
+const outboxRequestSymbol = Symbol('outboxRequest');
 
 const ulid = monotonicUlidFactory(Date.now());
 
@@ -2638,6 +2648,153 @@ class DataStore {
 		this.sync = undefined;
 		await this.runningProcesses.open();
 		this.state = DataStoreState.NotRunning;
+	}
+
+	/**
+	 * Ranchr fork (-r13): the storage for a read of the outbox. Opened when it
+	 * is not open yet, as `clear()` does; the sync engine is NEVER started
+	 * here, so a read cannot start a sync for an owner nobody has checked.
+	 */
+	private async storageForOutbox(): Promise<Storage> {
+		checkSchemaInitialized();
+		if (this.storage === undefined) {
+			this.storage = new Storage(
+				schema,
+				namespaceResolver,
+				getModelConstructorByModelName,
+				modelInstanceCreator,
+				this.storageAdapter,
+				this.sessionId,
+			);
+			await this.storage.init();
+		}
+
+		return this.storage;
+	}
+
+	/**
+	 * Ranchr fork (-r13): the rows of the outbox (the changes still queued)
+	 * and the outcomes of the rows that left it, read from the local store.
+	 * The outcomes are in the order they were written. Never the record data
+	 * of a row; an outcome carries the JSON the sender put on the wire.
+	 *
+	 * The rows are exact: a row for a record means the change is still
+	 * queued, whatever the Hub reported. Rejects when the store cannot be
+	 * read; a caller treats that as "unknown", never as "empty".
+	 */
+	async readOutbox(): Promise<{
+		rows: OutboxRow[];
+		outcomes: MutationOutcome[];
+	}> {
+		const storage = await this.storageForOutbox();
+		const MutationEventCtor =
+			syncClasses.MutationEvent as PersistentModelConstructor<MutationEvent>;
+		const MutationOutcomeCtor =
+			syncClasses.MutationOutcome as PersistentModelConstructor<MutationOutcome>;
+
+		return storage.runExclusive(async s => {
+			const events = await s.query(MutationEventCtor);
+			const outcomes = await s.query(MutationOutcomeCtor);
+
+			return {
+				rows: events.map(({ id, model, modelId, operation, saves }) => ({
+					id,
+					model,
+					modelId,
+					operation,
+					saves: saves ?? 1,
+				})),
+				outcomes: [...outcomes].sort((a, b) =>
+					a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+				),
+			};
+		});
+	}
+
+	/**
+	 * Ranchr fork (-r13): the local copies of records by id, in ONE turn of
+	 * the storage lock, WITHOUT starting DataStore. `query()` starts the sync
+	 * engine on its own; a read for the app's bookkeeping during a ranch
+	 * switch (after the clear, before the new owner's start) would start a
+	 * sync with the previous owner's sync expressions. Returns `null` for an
+	 * id with no local record. Rejects when the store cannot be read.
+	 */
+	async readLocal<T extends PersistentModel>(
+		modelConstructor: PersistentModelConstructor<T>,
+		ids: string[],
+	): Promise<Record<string, T | null>> {
+		const modelDefinition = getModelDefinition(modelConstructor);
+		if (!modelDefinition) {
+			throw new Error('Invalid model definition provided!');
+		}
+		const [keyField] = extractPrimaryKeyFieldNames(modelDefinition);
+		const storage = await this.storageForOutbox();
+
+		return storage.runExclusive(async s => {
+			const out: Record<string, T | null> = {};
+			for (const id of ids) {
+				const predicate = ModelPredicateCreator.createFromFlatEqualities<T>(
+					modelDefinition,
+					{ [keyField]: id },
+				);
+				const [record] = await s.query<T>(modelConstructor, predicate);
+				out[id] = record ?? null;
+			}
+
+			return out;
+		});
+	}
+
+	/**
+	 * Ranchr fork (-r13): removes the outcomes the app has consumed. Returns
+	 * how many it removed.
+	 */
+	async ackOutcomes(ids: string[]): Promise<number> {
+		if (ids.length === 0) {
+			return 0;
+		}
+		const storage = await this.storageForOutbox();
+		const MutationOutcomeCtor =
+			syncClasses.MutationOutcome as PersistentModelConstructor<MutationOutcome>;
+		const wanted = new Set(ids);
+
+		return storage.runExclusive(async s => {
+			const outcomes = await s.query(MutationOutcomeCtor);
+			let removed = 0;
+			for (const outcome of outcomes) {
+				if (wanted.has(outcome.id)) {
+					await s.delete(outcome);
+					removed++;
+				}
+			}
+
+			return removed;
+		});
+	}
+
+	/**
+	 * Ranchr fork (-r13): removes one queued row on the app's request (the
+	 * user gave a stuck change up). The row leaves with the outcome `dropped`,
+	 * and the sender starts a new loop so that it never sends the row. A
+	 * request that is in flight at that moment can still reach the server.
+	 * Returns `false` when no row has that id.
+	 */
+	async dropOutboxRow(id: string): Promise<boolean> {
+		const storage = await this.storageForOutbox();
+		const outbox = new MutationEventOutbox(
+			schema,
+			syncClasses.MutationEvent as PersistentModelConstructor<MutationEvent>,
+			syncClasses.MutationOutcome as PersistentModelConstructor<MutationOutcome>,
+			modelInstanceCreator,
+			outboxRequestSymbol,
+		);
+		const dropped = await storage.runExclusive(s => outbox.drop(s, id));
+
+		if (dropped) {
+			this.sync?.restartMutationLoop();
+		}
+
+		return dropped !== undefined;
 	}
 
 	/**

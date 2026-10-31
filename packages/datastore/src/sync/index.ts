@@ -75,11 +75,92 @@ export declare class MutationEvent {
 	public readonly modelId: string;
 	public readonly condition: string;
 	public readonly data: string;
+	/**
+	 * Ranchr fork (-r13): how many local saves this row carries. One at the
+	 * enqueue, one more for every later save of the record that the outbox
+	 * merged into it. The outcome of the row answers for that many saves.
+	 */
+	public readonly saves?: number | null;
 	constructor(init: ModelInit<MutationEvent>);
 	static copyOf(
 		src: MutationEvent,
 		mutator: (draft: MutableModel<MutationEvent>) => void | MutationEvent,
 	): MutationEvent;
+}
+
+/**
+ * Ranchr fork (-r13): how a row left the outbox.
+ *
+ * - `processed`: the server answered with the record (`version` is its `_version`).
+ * - `rejected`: the server refused the change and returned its own copy of
+ *   the record (`version`); the change did not apply.
+ * - `discarded`: the conflict handler gave the change up; the server copy
+ *   (`version`) was read back and merged.
+ * - `refused`: the server refused the change with no record (`errorType`),
+ *   answered with no record and no error, or every auth mode was exhausted.
+ *   The change is gone.
+ * - `cancelled`: a DELETE of the record cancelled this queued CREATE.
+ * - `stranded`: the row names a model this build does not have; it was
+ *   dropped (the sender cannot build its request).
+ * - `dropped`: `DataStore.dropOutboxRow()` removed it on the app's request.
+ */
+export type MutationOutcomeExit =
+	| 'processed'
+	| 'rejected'
+	| 'discarded'
+	| 'refused'
+	| 'cancelled'
+	| 'stranded'
+	| 'dropped';
+
+/**
+ * Ranchr fork (-r13): the durable record of an outbox exit. It is written in
+ * the same exclusive storage section that deletes the row, BEFORE the delete.
+ * The Hub events that report an exit are best effort (upstream commit
+ * 69a9cf078 made the emit optional); this record is not. The app reads the
+ * outcomes with `DataStore.readOutbox()` and removes the ones it has consumed
+ * with `DataStore.ackOutcomes()`.
+ */
+export declare class MutationOutcome {
+	readonly [__modelMeta__]: {
+		identifier: OptionallyManagedIdentifier<MutationOutcome, 'id'>;
+	};
+
+	/** A monotonic ULID: the outcomes sort by `id` in the order they were written */
+	public readonly id: string;
+	public readonly model: string;
+	public readonly modelId: string;
+	public readonly operation: TransformerMutationType;
+	public readonly exit: MutationOutcomeExit;
+	/** The row's `data`: the JSON the sender put on the wire (the merged fields) */
+	public readonly data: string;
+	/** The server's `_version` of the answer, when the exit carried one */
+	public readonly version?: number | null;
+	/** How many local saves the row carried (see `MutationEvent.saves`) */
+	public readonly saves: number;
+	/** The error type of a `refused` or `rejected` exit */
+	public readonly errorType?: string | null;
+	/**
+	 * A JSON array: the fields a `processed` UPDATE sent whose value the
+	 * server's answer does not hold (Automerge kept the server's value), or null
+	 */
+	public readonly notApplied?: string | null;
+	/** ISO time of the exit */
+	public readonly at: string;
+	constructor(init: ModelInit<MutationOutcome>);
+	static copyOf(
+		src: MutationOutcome,
+		mutator: (draft: MutableModel<MutationOutcome>) => void | MutationOutcome,
+	): MutationOutcome;
+}
+
+/** The facts of one outbox row that `DataStore.readOutbox()` returns: never the record data */
+export interface OutboxRow {
+	id: string;
+	model: string;
+	modelId: string;
+	operation: TransformerMutationType;
+	saves: number;
 }
 
 export declare class ModelMetadata {
@@ -205,10 +286,13 @@ export class SyncEngine {
 
 		const MutationEventCtor = this.modelClasses
 			.MutationEvent as PersistentModelConstructor<MutationEvent>;
+		const MutationOutcomeCtor = this.modelClasses
+			.MutationOutcome as PersistentModelConstructor<MutationOutcome>;
 
 		this.outbox = new MutationEventOutbox(
 			this.schema,
 			MutationEventCtor,
+			MutationOutcomeCtor,
 			modelInstanceCreator,
 			ownSymbol,
 		);
@@ -249,6 +333,18 @@ export class SyncEngine {
 
 		this.datastoreConnectivity =
 			this.connectivityMonitor || new DataStoreConnectivity();
+	}
+
+	/**
+	 * Ranchr fork (-r13): the sender holds the head of the outbox in memory
+	 * while it retries it. After `DataStore.dropOutboxRow()` removed a row, a
+	 * new loop must peek again, so that the dropped row is never sent.
+	 */
+	public restartMutationLoop(): void {
+		this.mutationsProcessor.pause();
+		if (this.online) {
+			this.mutationsProcessor.resume();
+		}
 	}
 
 	start(params: StartParams) {
@@ -1298,6 +1394,89 @@ export class SyncEngine {
 							type: 'String',
 							isArray: false,
 							isRequired: true,
+						},
+						// Ranchr fork (-r13): the saves the row carries (see `MutationEvent.saves`)
+						saves: {
+							name: 'saves',
+							type: 'Int',
+							isArray: false,
+							isRequired: false,
+						},
+					},
+				},
+				// Ranchr fork (-r13): the durable record of every outbox exit (see `MutationOutcome`)
+				MutationOutcome: {
+					name: 'MutationOutcome',
+					pluralName: 'MutationOutcomes',
+					syncable: false,
+					fields: {
+						id: {
+							name: 'id',
+							type: 'ID',
+							isRequired: true,
+							isArray: false,
+						},
+						model: {
+							name: 'model',
+							type: 'String',
+							isRequired: true,
+							isArray: false,
+						},
+						modelId: {
+							name: 'modelId',
+							type: 'String',
+							isRequired: true,
+							isArray: false,
+						},
+						operation: {
+							name: 'operation',
+							type: {
+								enum: 'Operationtype',
+							},
+							isArray: false,
+							isRequired: true,
+						},
+						exit: {
+							name: 'exit',
+							type: 'String',
+							isRequired: true,
+							isArray: false,
+						},
+						data: {
+							name: 'data',
+							type: 'String',
+							isRequired: true,
+							isArray: false,
+						},
+						version: {
+							name: 'version',
+							type: 'Int',
+							isRequired: false,
+							isArray: false,
+						},
+						saves: {
+							name: 'saves',
+							type: 'Int',
+							isRequired: true,
+							isArray: false,
+						},
+						errorType: {
+							name: 'errorType',
+							type: 'String',
+							isRequired: false,
+							isArray: false,
+						},
+						notApplied: {
+							name: 'notApplied',
+							type: 'String',
+							isRequired: false,
+							isArray: false,
+						},
+						at: {
+							name: 'at',
+							type: 'String',
+							isRequired: true,
+							isArray: false,
 						},
 					},
 				},

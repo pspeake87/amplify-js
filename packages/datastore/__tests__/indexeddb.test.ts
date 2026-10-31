@@ -23,7 +23,8 @@ import {
 	Team,
 } from './model';
 let db: idb.IDBPDatabase;
-const DB_VERSION = 3;
+// Ranchr fork (-r13): version 4 adds the `sync_MutationOutcome` store
+const DB_VERSION = 4;
 
 const { indexedDB } = require('fake-indexeddb');
 const IDBKeyRange = require('fake-indexeddb/lib/FDBKeyRange');
@@ -73,6 +74,7 @@ describe('Indexed db storage test', () => {
 			`${DATASTORE}_Setting`,
 			`${SYNC}_ModelMetadata`,
 			`${SYNC}_MutationEvent`,
+			`${SYNC}_MutationOutcome`,
 			`${USER}_Album`,
 			`${USER}_Author`,
 			`${USER}_Blog`,
@@ -834,6 +836,7 @@ describe('DB versions migration', () => {
 				`${DATASTORE}_Setting`,
 				`${SYNC}_ModelMetadata`,
 				`${SYNC}_MutationEvent`,
+				`${SYNC}_MutationOutcome`,
 				...[
 					Author,
 					Album,

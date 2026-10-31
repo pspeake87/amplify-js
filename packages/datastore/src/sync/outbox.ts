@@ -14,18 +14,106 @@ import {
 	QueryOne,
 	SchemaModel,
 } from '../types';
-import { SYNC, USER, directedValueEquality } from '../util';
+import {
+	SYNC,
+	USER,
+	directedValueEquality,
+	monotonicUlidFactory,
+} from '../util';
 
 import { TransformerMutationType, getIdentifierValue } from './utils';
 
-import { MutationEvent } from './index';
+import { MutationEvent, MutationOutcome, MutationOutcomeExit } from './index';
+
+/**
+ * Ranchr fork (-r13): how a row leaves the outbox, as the sender knows it.
+ * The `version` of the outcome comes from the server record that the caller
+ * hands to `dequeue`, when there is one.
+ */
+export interface OutboxExitInfo {
+	exit: MutationOutcomeExit;
+	errorType?: string;
+	/** The sent fields the server's answer does not hold (an UPDATE only) */
+	notApplied?: string[];
+}
+
+/**
+ * The newest outcomes the store keeps when nobody acknowledges them (a web
+ * build without a consumer). The mobile app acknowledges what it consumed, so
+ * the store stays far below this.
+ */
+export const OUTCOME_LIMIT = 2000;
+/** A prune runs once per this many exits, and at the first exit of a process */
+const PRUNE_EVERY = 100;
+
+const nextOutcomeId = monotonicUlidFactory();
+
+const byId = (a: { id: string }, b: { id: string }) =>
+	a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+
+/**
+ * Writes the outcome of `row` (Ranchr fork, -r13). Call it inside the
+ * exclusive section that deletes the row, BEFORE the delete: a stop between
+ * the two leaves the row in the outbox (it is sent again), never an exit with
+ * no record of it.
+ */
+export const writeOutcome = async (
+	storage: StorageClass,
+	MutationOutcomeCtor: PersistentModelConstructor<MutationOutcome>,
+	modelInstanceCreator: ModelInstanceCreator,
+	ownSymbol: symbol,
+	row: MutationEvent,
+	info: OutboxExitInfo,
+	record?: PersistentModel,
+): Promise<MutationOutcome> => {
+	const version = record?._version;
+	const outcome = modelInstanceCreator(MutationOutcomeCtor, {
+		id: nextOutcomeId(),
+		model: row.model,
+		modelId: row.modelId,
+		operation: row.operation,
+		exit: info.exit,
+		data: row.data,
+		version: typeof version === 'number' ? version : null,
+		saves: row.saves ?? 1,
+		errorType: info.errorType ?? null,
+		notApplied: info.notApplied ? JSON.stringify(info.notApplied) : null,
+		at: new Date().toISOString(),
+	});
+	await storage.save(outcome, undefined, ownSymbol);
+
+	return outcome;
+};
+
+/** Keeps the newest `limit` outcomes. Returns how many it removed. */
+export const pruneOutcomes = async (
+	storage: StorageClass,
+	MutationOutcomeCtor: PersistentModelConstructor<MutationOutcome>,
+	ownSymbol: symbol,
+	limit: number = OUTCOME_LIMIT,
+): Promise<number> => {
+	const all = await storage.query(MutationOutcomeCtor);
+	if (all.length <= limit) {
+		return 0;
+	}
+	const oldest = [...all].sort(byId).slice(0, all.length - limit);
+	for (const outcome of oldest) {
+		await storage.delete(outcome, undefined, ownSymbol);
+	}
+
+	return oldest.length;
+};
 
 // TODO: Persist deleted ids
 // https://github.com/aws-amplify/amplify-js/blob/datastore-docs/packages/datastore/docs/sync-engine.md#outbox
 class MutationEventOutbox {
+	/** Starts one short of the limit: the first exit of a process prunes */
+	private exitsSincePrune = PRUNE_EVERY - 1;
+
 	constructor(
 		private readonly schema: InternalSchema,
 		private readonly _MutationEvent: PersistentModelConstructor<MutationEvent>,
+		private readonly _MutationOutcome: PersistentModelConstructor<MutationOutcome>,
 		private readonly modelInstanceCreator: ModelInstanceCreator,
 		private readonly ownSymbol: symbol,
 	) {}
@@ -62,7 +150,14 @@ class MutationEventOutbox {
 
 			if (first.operation === TransformerMutationType.CREATE) {
 				if (incomingMutationType === TransformerMutationType.DELETE) {
-					await s.delete(this._MutationEvent, predicate);
+					// Ranchr fork (-r13): the record is deleted before its CREATE
+					// was sent. Every queued row of the record goes, and the DELETE
+					// is not queued. Each row gets an outcome, so the app learns
+					// that the saves it carried never reach the server.
+					const cancelled = await s.query(this._MutationEvent, predicate);
+					for (const row of cancelled) {
+						await this.settle(s, row, { exit: 'cancelled' });
+					}
 				} else {
 					// first gets updated with the incoming mutation's data, condition intentionally skipped
 
@@ -72,6 +167,7 @@ class MutationEventOutbox {
 					await s.save(
 						this._MutationEvent.copyOf(first, draft => {
 							draft.data = merged.data;
+							draft.saves = merged.saves;
 						}),
 						undefined,
 						this.ownSymbol,
@@ -99,7 +195,8 @@ class MutationEventOutbox {
 	}
 
 	/**
-	 * Removes the head of the queue after the server answered for it.
+	 * Removes the head of the queue after the server answered for it, and
+	 * writes its outcome first (Ranchr fork, -r13).
 	 *
 	 * The head is read one time. When `expectedId` is given and the head is a
 	 * different event (another tab on the same outbox removed the sent event
@@ -111,6 +208,7 @@ class MutationEventOutbox {
 		record?: PersistentModel,
 		recordOp?: TransformerMutationType,
 		expectedId?: string,
+		info: OutboxExitInfo = { exit: 'processed' },
 	): Promise<MutationEvent | undefined> {
 		const head = await this.peek(storage);
 
@@ -122,15 +220,114 @@ class MutationEventOutbox {
 			await this.syncOutboxVersionsOnDequeue(storage, record, head, recordOp!);
 		}
 
-		await storage.delete(head);
+		await this.settle(storage, head, info, record);
 
 		return head;
+	}
+
+	/**
+	 * Ranchr fork (-r13): removes one row on the app's request
+	 * (`DataStore.dropOutboxRow`), with the outcome `dropped`. Returns the row,
+	 * or `undefined` when no row has that id.
+	 */
+	public async drop(
+		storage: StorageClass,
+		id: string,
+	): Promise<MutationEvent | undefined> {
+		const mutationEventModelDefinition =
+			this.schema.namespaces[SYNC].models.MutationEvent;
+		const [row] = await storage.query(
+			this._MutationEvent,
+			ModelPredicateCreator.createFromAST<MutationEvent>(
+				mutationEventModelDefinition,
+				{ and: [{ id: { eq: id } }] },
+			),
+		);
+
+		if (!row) {
+			return undefined;
+		}
+
+		await this.settle(storage, row, { exit: 'dropped' });
+
+		return row;
 	}
 
 	public async peek(storage: StorageFacade): Promise<MutationEvent> {
 		const head = await storage.queryOne(this._MutationEvent, QueryOne.FIRST);
 
 		return head!;
+	}
+
+	/**
+	 * Ranchr fork (-r13): the outcome first, then the row, inside the caller's
+	 * exclusive section. A stop between the two leaves the row (it is sent
+	 * again, and the second exit writes a second outcome), never an exit with
+	 * no outcome.
+	 */
+	private async settle(
+		storage: StorageClass,
+		row: MutationEvent,
+		info: OutboxExitInfo,
+		record?: PersistentModel,
+	): Promise<void> {
+		const notApplied =
+			info.exit === 'processed' &&
+			record &&
+			row.operation === TransformerMutationType.UPDATE
+				? this.fieldsNotApplied(row, record)
+				: undefined;
+		await writeOutcome(
+			storage,
+			this._MutationOutcome,
+			this.modelInstanceCreator,
+			this.ownSymbol,
+			row,
+			notApplied && notApplied.length > 0 ? { ...info, notApplied } : info,
+			record,
+		);
+		await storage.delete(row);
+
+		this.exitsSincePrune++;
+		if (this.exitsSincePrune >= PRUNE_EVERY) {
+			this.exitsSincePrune = 0;
+			await pruneOutcomes(storage, this._MutationOutcome, this.ownSymbol);
+		}
+	}
+
+	/**
+	 * Ranchr fork (-r13): the fields an UPDATE sent whose value the server's
+	 * answer does not hold. AppSync's Automerge keeps the server's value of a
+	 * conflicting scalar and still answers with success, so "processed" alone
+	 * does not say the change was kept. The sync and timestamp fields do not
+	 * count (the same rule as `syncOutboxVersionsOnDequeue`).
+	 */
+	private fieldsNotApplied(
+		row: MutationEvent,
+		record: PersistentModel,
+	): string[] {
+		let sent: Record<string, any>;
+		try {
+			sent = JSON.parse(row.data) ?? {};
+		} catch {
+			return [];
+		}
+		const {
+			_version: __version,
+			_lastChangedAt: __lastChangedAt,
+			_deleted: __deleted,
+			...outgoing
+		} = sent;
+		const compared = this.removeTimestampFields(row.model, { ...outgoing });
+		const normalize = (value: unknown) =>
+			JSON.stringify(value === undefined ? null : value);
+
+		return Object.keys(compared).filter(
+			key =>
+				key !== 'id' &&
+				normalize((compared as Record<string, any>)[key]) !==
+					normalize((record as Record<string, any>)[key]),
+		);
 	}
 
 	/**
@@ -283,6 +480,8 @@ class MutationEventOutbox {
 		return this.modelInstanceCreator(this._MutationEvent, {
 			...current,
 			data,
+			// Ranchr fork (-r13): the merged row answers for the saves of both
+			saves: (previous.saves ?? 1) + (current.saves ?? 1),
 		});
 	}
 

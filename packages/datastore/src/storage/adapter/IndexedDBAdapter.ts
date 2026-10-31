@@ -54,7 +54,11 @@ const logger = new ConsoleLogger('DataStore');
  */
 const MULTI_OR_CONDITION_SCAN_BREAKPOINT = 7;
 //
-const DB_VERSION = 3;
+// Ranchr fork (-r13): version 4 adds the `sync_MutationOutcome` store. A
+// version change is one way: a build that opens the database at version 3
+// cannot open a version-4 database (VersionError). The migration from 3 to 4
+// only creates the stores that the current schema has and the database lacks.
+const DB_VERSION = 4;
 
 class IndexedDBAdapter extends StorageAdapterBase {
 	protected db!: idb.IDBPDatabase;
@@ -113,8 +117,35 @@ class IndexedDBAdapter extends StorageAdapterBase {
 					return;
 				}
 
+				// Ranchr fork (-r13): a database at version 3 gets the stores the
+				// schema has and the database lacks (`sync_MutationOutcome`). The
+				// rows of the other stores are untouched.
+				if (oldVersion === 3 && newVersion! >= 4) {
+					const objectStoreNames = new Set(txn.objectStoreNames);
+					Object.keys(this.schema.namespaces).forEach(namespaceName => {
+						const namespace = this.schema.namespaces[namespaceName];
+
+						Object.keys(namespace.models)
+							.map(modelName => [
+								modelName,
+								getStorename(namespaceName, modelName),
+							])
+							.filter(([, storeName]) => !objectStoreNames.has(storeName))
+							.forEach(([modelName, storeName]) => {
+								this.createObjectStoreForModel(
+									db,
+									namespaceName,
+									storeName,
+									modelName,
+								);
+							});
+					});
+
+					return;
+				}
+
 				// migrate existing database to latest schema
-				if ((oldVersion === 1 || oldVersion === 2) && newVersion === 3) {
+				if ((oldVersion === 1 || oldVersion === 2) && newVersion! >= 3) {
 					try {
 						for (const storeName of txn.objectStoreNames) {
 							const origStore = txn.objectStore(storeName);
